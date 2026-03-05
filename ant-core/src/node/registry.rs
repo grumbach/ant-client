@@ -105,6 +105,12 @@ impl NodeRegistry {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+
+    /// Clear all nodes and reset the next ID counter.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.next_id = 1;
+    }
 }
 
 #[cfg(test)]
@@ -200,5 +206,20 @@ mod tests {
         let mut reg = NodeRegistry::load(&path).unwrap();
         let result = reg.remove(999);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn clear_empties_registry_and_resets_next_id() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("json");
+        let mut reg = NodeRegistry::load(&path).unwrap();
+        reg.add(make_config(0));
+        reg.add(make_config(0));
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.next_id, 3);
+
+        reg.clear();
+        assert!(reg.is_empty());
+        assert_eq!(reg.next_id, 1);
     }
 }

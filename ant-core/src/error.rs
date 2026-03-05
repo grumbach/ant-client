@@ -49,6 +49,11 @@ pub enum Error {
 
     #[error("Invalid rewards address: {0}")]
     InvalidRewardsAddress(String),
+
+    #[error(
+        "Cannot reset while nodes are running ({0} node(s) still running). Stop all nodes first."
+    )]
+    NodesStillRunning(u32),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

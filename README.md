@@ -133,6 +133,32 @@ Added 3 node(s):
 
 If the daemon is running, the command routes through its REST API. Otherwise, it operates directly on the registry file.
 
+### `ant node reset`
+
+Remove all node data directories, log directories, and clear the registry, returning the system to a clean state. All nodes must be stopped before running this command.
+
+```
+$ ant node reset
+This will remove all node data directories, log directories, and clear the registry.
+Are you sure? [y/N] y
+Reset complete:
+  Nodes cleared: 3
+  Removed data dir: ~/.local/share/ant/nodes/node-1
+  Removed data dir: ~/.local/share/ant/nodes/node-2
+  Removed data dir: ~/.local/share/ant/nodes/node-3
+  Removed log dir:  ~/.local/share/ant/logs/node-1/logs
+  Removed log dir:  ~/.local/share/ant/logs/node-2/logs
+  Removed log dir:  ~/.local/share/ant/logs/node-3/logs
+```
+
+#### Options
+
+| Flag | Description |
+|------|-------------|
+| `--force` | Skip the confirmation prompt |
+
+If any nodes are running, the command will fail with an error asking you to stop them first. If the daemon is running, the command routes through its REST API.
+
 ### Global Flags
 
 | Flag | Description |
@@ -149,6 +175,7 @@ When the daemon is running, it exposes these endpoints on `127.0.0.1:<port>`:
 | GET | `/api/v1/events` | SSE stream of real-time node events |
 | POST | `/api/v1/nodes` | Add one or more nodes to the registry |
 | DELETE | `/api/v1/nodes/{id}` | Remove a node from the registry |
+| POST | `/api/v1/reset` | Reset all node state (fails if nodes running) |
 | GET | `/api/v1/openapi.json` | OpenAPI 3.1 specification |
 
 ## Development

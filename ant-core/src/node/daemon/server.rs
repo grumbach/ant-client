@@ -19,7 +19,7 @@ use crate::node::daemon::supervisor::Supervisor;
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
 use crate::node::types::{
-    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, RemoveNodeResult,
+    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, RemoveNodeResult, ResetResult,
 };
 
 /// Shared application state for the daemon HTTP server.
@@ -86,6 +86,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/events", get(get_events))
         .route("/api/v1/nodes", post(post_nodes))
         .route("/api/v1/nodes/{id}", delete(delete_node))
+        .route("/api/v1/reset", post(post_reset))
         .route("/api/v1/openapi.json", get(get_openapi))
         .with_state(state)
 }
@@ -181,6 +182,42 @@ async fn delete_node(
     }
 }
 
+/// POST /api/v1/reset — Reset all node state.
+async fn post_reset(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<ResetResult>, (StatusCode, Json<serde_json::Value>)> {
+    // Check if any nodes are running via supervisor
+    let supervisor = state.supervisor.read().await;
+    let (running, _, _) = supervisor.node_counts();
+    if running > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("Cannot reset while nodes are running ({running} node(s) still running). Stop all nodes first."),
+                "nodes_running": running,
+            })),
+        ));
+    }
+    drop(supervisor);
+
+    let registry_path = state.config.registry_path.clone();
+
+    match crate::node::reset(&registry_path) {
+        Ok(result) => {
+            // Update the in-memory registry to stay in sync
+            let mut registry = state.registry.write().await;
+            if let Ok(fresh) = NodeRegistry::load(&registry_path) {
+                *registry = fresh;
+            }
+            Ok(Json(result))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
 async fn get_openapi() -> impl IntoResponse {
     // Minimal OpenAPI 3.1 spec - will be expanded with utoipa as endpoints grow
     let spec = serde_json::json!({
@@ -266,6 +303,25 @@ async fn get_openapi() -> impl IntoResponse {
                         },
                         "404": {
                             "description": "Node not found"
+                        }
+                    }
+                }
+            },
+            "/api/v1/reset": {
+                "post": {
+                    "summary": "Reset all node state",
+                    "description": "Remove all node data directories, log directories, and clear the registry. Fails if any nodes are running.",
+                    "responses": {
+                        "200": {
+                            "description": "Reset successful",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ResetResult" }
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Nodes still running"
                         }
                     }
                 }

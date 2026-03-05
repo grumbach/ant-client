@@ -244,6 +244,26 @@ pub struct RemoveNodeResult {
     pub removed: NodeConfig,
 }
 
+/// Options for resetting all node state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ResetOpts {
+    /// Skip confirmation (used by CLI layer; ignored by core).
+    pub force: bool,
+}
+
+/// Result of resetting all node state.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ResetResult {
+    /// Number of nodes that were cleared from the registry.
+    pub nodes_cleared: u32,
+    /// Data directories that were removed.
+    #[schema(value_type = Vec<String>)]
+    pub data_dirs_removed: Vec<PathBuf>,
+    /// Log directories that were removed.
+    #[schema(value_type = Vec<String>)]
+    pub log_dirs_removed: Vec<PathBuf>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

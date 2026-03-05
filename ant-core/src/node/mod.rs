@@ -12,7 +12,7 @@ use crate::config;
 use crate::error::{Error, Result};
 use crate::node::binary::ProgressReporter;
 use crate::node::registry::NodeRegistry;
-use crate::node::types::{AddNodeOpts, AddNodeResult, NodeConfig, RemoveNodeResult};
+use crate::node::types::{AddNodeOpts, AddNodeResult, NodeConfig, RemoveNodeResult, ResetResult};
 
 /// Add one or more nodes to the registry.
 ///
@@ -111,7 +111,7 @@ pub async fn add_nodes(
         // Copy the binary into this node's data directory so each node
         // has its own copy. This allows safe per-node upgrades without
         // affecting running nodes.
-        let node_binary = node.data_dir.join(&binary_file_name);
+        let node_binary = node.data_dir.join(binary_file_name);
         std::fs::copy(&cached_binary, &node_binary)?;
         #[cfg(unix)]
         {
@@ -136,6 +136,46 @@ pub fn remove_node(node_id: u32, registry_path: &Path) -> Result<RemoveNodeResul
     let removed = registry.remove(node_id)?;
     registry.save()?;
     Ok(RemoveNodeResult { removed })
+}
+
+/// Reset all node state: remove all data directories, log directories, and clear the registry.
+///
+/// This function:
+/// 1. Loads the registry (with file lock)
+/// 2. Iterates over all registered nodes
+/// 3. Removes each node's data directory
+/// 4. Removes each node's log directory (if set)
+/// 5. Clears the registry (empties nodes, resets next_id to 1)
+///
+/// Does NOT check if nodes are running — callers must verify that first.
+pub fn reset(registry_path: &Path) -> Result<ResetResult> {
+    let (mut registry, _lock) = NodeRegistry::load_locked(registry_path)?;
+
+    let mut data_dirs_removed = Vec::new();
+    let mut log_dirs_removed = Vec::new();
+    let nodes_cleared = registry.len() as u32;
+
+    for node in registry.list() {
+        if node.data_dir.exists() {
+            std::fs::remove_dir_all(&node.data_dir)?;
+            data_dirs_removed.push(node.data_dir.clone());
+        }
+        if let Some(ref log_dir) = node.log_dir {
+            if log_dir.exists() {
+                std::fs::remove_dir_all(log_dir)?;
+                log_dirs_removed.push(log_dir.clone());
+            }
+        }
+    }
+
+    registry.clear();
+    registry.save()?;
+
+    Ok(ResetResult {
+        nodes_cleared,
+        data_dirs_removed,
+        log_dirs_removed,
+    })
 }
 
 /// Determine the data directory for a node.
@@ -357,5 +397,59 @@ mod tests {
         let result = remove_node(999, &reg_path);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::NodeNotFound(999)));
+    }
+
+    #[tokio::test]
+    async fn reset_clears_all_nodes_and_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = create_fake_binary(tmp.path());
+        let reg_path = test_registry_path(tmp.path());
+
+        // Add 2 nodes
+        let opts = AddNodeOpts {
+            count: 2,
+            rewards_address: "0xreset_test".to_string(),
+            data_dir_path: Some(tmp.path().join("data")),
+            log_dir_path: Some(tmp.path().join("logs")),
+            binary_source: BinarySource::LocalPath(binary),
+            ..Default::default()
+        };
+
+        let result = add_nodes(opts, &reg_path, &NoopProgress).await.unwrap();
+        assert_eq!(result.nodes_added.len(), 2);
+
+        // Verify directories exist
+        for node in &result.nodes_added {
+            assert!(node.data_dir.exists());
+            assert!(node.log_dir.as_ref().unwrap().exists());
+        }
+
+        // Reset
+        let reset_result = reset(&reg_path).unwrap();
+        assert_eq!(reset_result.nodes_cleared, 2);
+        assert_eq!(reset_result.data_dirs_removed.len(), 2);
+        assert_eq!(reset_result.log_dirs_removed.len(), 2);
+
+        // Verify directories were removed
+        for node in &result.nodes_added {
+            assert!(!node.data_dir.exists());
+            assert!(!node.log_dir.as_ref().unwrap().exists());
+        }
+
+        // Verify registry is empty and next_id reset
+        let reg = NodeRegistry::load(&reg_path).unwrap();
+        assert!(reg.is_empty());
+        assert_eq!(reg.next_id, 1);
+    }
+
+    #[test]
+    fn reset_empty_registry_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = test_registry_path(tmp.path());
+
+        let result = reset(&reg_path).unwrap();
+        assert_eq!(result.nodes_cleared, 0);
+        assert!(result.data_dirs_removed.is_empty());
+        assert!(result.log_dirs_removed.is_empty());
     }
 }
