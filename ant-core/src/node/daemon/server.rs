@@ -6,7 +6,7 @@ use std::time::Instant;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use tokio::sync::broadcast;
@@ -84,6 +84,7 @@ pub async fn start(
 
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/console", get(get_console))
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/events", get(get_events))
         .route("/api/v1/nodes/status", get(get_nodes_status))
@@ -667,6 +668,10 @@ async fn get_openapi() -> impl IntoResponse {
         }
     });
     Json(spec)
+}
+
+async fn get_console() -> Html<&'static str> {
+    Html(include_str!("console.html"))
 }
 
 fn write_file(path: &PathBuf, contents: &str) -> Result<()> {

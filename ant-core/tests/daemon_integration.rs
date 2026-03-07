@@ -108,3 +108,37 @@ async fn port_and_pid_files_written() {
         "PID file should be removed after shutdown"
     );
 }
+
+#[tokio::test]
+async fn console_returns_html() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(&dir);
+    let registry = NodeRegistry::load(&config.registry_path).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let addr = server::start(config, registry, shutdown.clone())
+        .await
+        .unwrap();
+
+    let url = format!("http://{addr}/console");
+    let resp = reqwest::get(&url).await.unwrap();
+    assert!(resp.status().is_success());
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.contains("text/html"),
+        "Expected text/html, got {content_type}"
+    );
+
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Node Console"));
+    assert!(body.contains("/api/v1"));
+
+    shutdown.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
