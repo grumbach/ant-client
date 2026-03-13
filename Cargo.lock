@@ -111,6 +111,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "utoipa",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

@@ -496,18 +496,42 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn send_signal_term(_pid: u32) {
-    unimplemented!("Windows process termination requires windows-sys dependency")
+fn send_signal_term(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if !handle.is_null() {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
 }
 
 #[cfg(windows)]
-fn send_signal_kill(_pid: u32) {
-    unimplemented!("Windows process termination requires windows-sys dependency")
+fn send_signal_kill(pid: u32) {
+    // Windows has no SIGKILL equivalent; TerminateProcess is already forceful.
+    send_signal_term(pid);
 }
 
 #[cfg(windows)]
-fn is_process_alive(_pid: u32) -> bool {
-    unimplemented!("Windows process check requires windows-sys dependency")
+fn is_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let success = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        success != 0 && exit_code == STILL_ACTIVE as u32
+    }
 }
 
 #[cfg(test)]

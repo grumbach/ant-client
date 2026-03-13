@@ -26,13 +26,21 @@ pub async fn spawn_node(
     let stderr_file = std::fs::File::create(&stderr_path)
         .map_err(|e| Error::ProcessSpawn(format!("Failed to create stderr log: {e}")))?;
 
-    let child = Command::new(binary_path)
-        .args(args)
+    let mut cmd = Command::new(binary_path);
+    cmd.args(args)
         .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .stdout(stdout_file)
         .stderr(stderr_file)
-        .kill_on_drop(false)
+        .kill_on_drop(false);
+
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let child = cmd
         .spawn()
         .map_err(|e| Error::ProcessSpawn(format!("Failed to spawn node process: {e}")))?;
 
