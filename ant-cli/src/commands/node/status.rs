@@ -1,7 +1,8 @@
 use clap::Args;
+use colored::Colorize;
 
 use ant_core::node::daemon::client;
-use ant_core::node::types::DaemonConfig;
+use ant_core::node::types::{DaemonConfig, NodeStatus};
 
 #[derive(Args)]
 pub struct StatusArgs {}
@@ -21,26 +22,48 @@ impl StatusArgs {
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else {
             if result.nodes.is_empty() {
-                println!("No nodes registered. Add nodes first with: ant node add");
+                println!(
+                    "{} No nodes registered. Add nodes first with: {}",
+                    "●".yellow(),
+                    "ant node add".cyan()
+                );
                 return Ok(());
             }
 
-            println!("{:<4} {:<12} {:<10} Status", "ID", "Name", "Version");
+            // Table header
+            println!(
+                "  {:<4} {:<14} {:<10} {}",
+                "ID".dimmed(),
+                "Name".dimmed(),
+                "Version".dimmed(),
+                "Status".dimmed()
+            );
+            println!("  {}", "─".repeat(44).dimmed());
+
             for node in &result.nodes {
-                let status_str = serde_json::to_value(node.status)?;
+                let status_display = match node.status {
+                    NodeStatus::Running => format!("{} {}", "●".green(), "Running".green()),
+                    NodeStatus::Stopped => format!("{} {}", "●".dimmed(), "Stopped".dimmed()),
+                    NodeStatus::Starting => format!("{} {}", "●".yellow(), "Starting".yellow()),
+                    NodeStatus::Stopping => format!("{} {}", "●".yellow(), "Stopping".yellow()),
+                    NodeStatus::Errored => format!("{} {}", "●".red(), "Errored".red()),
+                };
                 println!(
-                    "{:<4} {:<12} {:<10} {}",
-                    node.node_id,
+                    "  {:<4} {:<14} {:<10} {}",
+                    node.node_id.to_string().bold(),
                     node.name,
-                    node.version,
-                    status_str.as_str().unwrap_or("unknown"),
+                    node.version.dimmed(),
+                    status_display
                 );
             }
 
             if !daemon_status.running {
                 println!();
-                println!("Note: daemon is not running. All nodes shown as stopped.");
-                println!("Start the daemon with: ant node daemon start");
+                println!(
+                    "  {} Daemon is not running — all nodes shown as stopped.",
+                    "!".yellow().bold()
+                );
+                println!("  Start it with: {}", "ant node daemon start".cyan());
             }
         }
 

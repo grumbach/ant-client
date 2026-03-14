@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Args;
+use colored::Colorize;
 
 use ant_core::node::binary::ProgressReporter;
 use ant_core::node::daemon::client;
@@ -72,21 +73,42 @@ impl AddArgs {
         if json_output {
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else {
-            println!("Added {} node(s):", result.nodes_added.len());
+            println!(
+                "{} Added {} node(s):",
+                "✓".green().bold(),
+                result.nodes_added.len().to_string().bold()
+            );
+            println!();
             for node in &result.nodes_added {
-                println!("  Node {}:", node.id);
-                println!("    Data dir: {}", node.data_dir.display());
+                println!(
+                    "  {} {}",
+                    "●".cyan(),
+                    format!("Node {} ({})", node.id, node.service_name).bold()
+                );
+                println!(
+                    "    {} {}",
+                    "Data".dimmed(),
+                    node.data_dir.display().to_string().white()
+                );
                 if let Some(ref log_dir) = node.log_dir {
-                    println!("    Log dir:  {}", log_dir.display());
+                    println!(
+                        "    {} {}",
+                        "Logs".dimmed(),
+                        log_dir.display().to_string().white()
+                    );
                 }
                 if let Some(port) = node.node_port {
-                    println!("    Port:     {port}");
+                    println!("    {} {}", "Port".dimmed(), port.to_string().cyan());
                 }
                 if let Some(port) = node.metrics_port {
-                    println!("    Metrics:  {port}");
+                    println!("    {} {}", "Metrics".dimmed(), port.to_string().cyan());
                 }
-                println!("    Binary:   {}", node.binary_path.display());
-                println!("    Version:  {}", node.version);
+                println!(
+                    "    {} {}",
+                    "Binary".dimmed(),
+                    node.binary_path.display().to_string().dimmed()
+                );
+                println!("    {} {}", "Version".dimmed(), node.version.green());
             }
         }
 
@@ -201,17 +223,25 @@ struct CliProgress;
 
 impl ProgressReporter for CliProgress {
     fn report_started(&self, message: &str) {
-        println!("{message}");
+        println!("{} {message}", "⟳".cyan());
     }
 
     fn report_progress(&self, bytes: u64, total: u64) {
         if total > 0 {
             let pct = (bytes as f64 / total as f64 * 100.0) as u32;
-            print!("\rDownloading... {pct}%");
+            let bar_width = 30;
+            let filled = (pct as usize * bar_width) / 100;
+            let empty = bar_width - filled;
+            let bar = format!(
+                "{}{}",
+                "█".repeat(filled).cyan(),
+                "░".repeat(empty).dimmed()
+            );
+            print!("\r  {} {bar} {pct:>3}%", "Downloading".dimmed());
         }
     }
 
     fn report_complete(&self, message: &str) {
-        println!("\r{message}");
+        println!("\r{} {message}", "✓".green().bold());
     }
 }

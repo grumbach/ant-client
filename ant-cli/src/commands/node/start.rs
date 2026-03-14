@@ -1,4 +1,5 @@
 use clap::Args;
+use colored::Colorize;
 
 use ant_core::node::daemon::client;
 use ant_core::node::types::DaemonConfig;
@@ -45,8 +46,11 @@ impl StartArgs {
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else {
             println!(
-                "Node {} ({}) started (PID {})",
-                result.service_name, result.node_id, result.pid
+                "{} Node {} ({}) started — PID {}",
+                "✓".green().bold(),
+                result.service_name.bold(),
+                result.node_id.to_string().dimmed(),
+                result.pid.to_string().cyan()
             );
         }
 
@@ -60,26 +64,44 @@ impl StartArgs {
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else {
             if !result.started.is_empty() {
-                println!("Started {} node(s):", result.started.len());
+                println!(
+                    "{} Started {} node(s):",
+                    "✓".green().bold(),
+                    result.started.len().to_string().bold()
+                );
                 for node in &result.started {
                     println!(
-                        "  {} ({}) — PID {}",
-                        node.service_name, node.node_id, node.pid
+                        "  {} {} ({}) — PID {}",
+                        "●".green(),
+                        node.service_name.bold(),
+                        node.node_id.to_string().dimmed(),
+                        node.pid.to_string().cyan()
                     );
                 }
             }
             if !result.already_running.is_empty() {
-                println!("Already running: {} node(s)", result.already_running.len());
+                println!(
+                    "{} Already running: {} node(s)",
+                    "●".yellow(),
+                    result.already_running.len().to_string().bold()
+                );
                 for id in &result.already_running {
-                    println!("  Node {id}");
+                    println!("  {} Node {}", "─".dimmed(), id.to_string().dimmed());
                 }
             }
             if !result.failed.is_empty() {
-                println!("Failed to start {} node(s):", result.failed.len());
+                println!(
+                    "{} Failed to start {} node(s):",
+                    "✗".red().bold(),
+                    result.failed.len().to_string().bold()
+                );
                 for fail in &result.failed {
                     println!(
-                        "  {} ({}) — {}",
-                        fail.service_name, fail.node_id, fail.error
+                        "  {} {} ({}) — {}",
+                        "●".red(),
+                        fail.service_name.bold(),
+                        fail.node_id.to_string().dimmed(),
+                        fail.error.red()
                     );
                 }
             }
@@ -87,7 +109,11 @@ impl StartArgs {
                 && result.already_running.is_empty()
                 && result.failed.is_empty()
             {
-                println!("No nodes registered. Add nodes first with: ant node add");
+                println!(
+                    "{} No nodes registered. Add nodes first with: {}",
+                    "●".yellow(),
+                    "ant node add".cyan()
+                );
             }
         }
 

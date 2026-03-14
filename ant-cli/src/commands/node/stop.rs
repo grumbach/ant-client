@@ -1,4 +1,5 @@
 use clap::Args;
+use colored::Colorize;
 
 use ant_core::node::daemon::client;
 use ant_core::node::types::DaemonConfig;
@@ -43,7 +44,12 @@ impl StopArgs {
         if json_output {
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else {
-            println!("Node {} ({}) stopped", result.service_name, result.node_id);
+            println!(
+                "{} Node {} ({}) stopped",
+                "✓".green().bold(),
+                result.service_name.bold(),
+                result.node_id.to_string().dimmed()
+            );
         }
 
         Ok(())
@@ -56,23 +62,43 @@ impl StopArgs {
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else {
             if !result.stopped.is_empty() {
-                println!("Stopped {} node(s):", result.stopped.len());
+                println!(
+                    "{} Stopped {} node(s):",
+                    "✓".green().bold(),
+                    result.stopped.len().to_string().bold()
+                );
                 for node in &result.stopped {
-                    println!("  {} ({})", node.service_name, node.node_id);
+                    println!(
+                        "  {} {} ({})",
+                        "●".dimmed(),
+                        node.service_name.bold(),
+                        node.node_id.to_string().dimmed()
+                    );
                 }
             }
             if !result.already_stopped.is_empty() {
-                println!("Already stopped: {} node(s)", result.already_stopped.len());
+                println!(
+                    "{} Already stopped: {} node(s)",
+                    "●".yellow(),
+                    result.already_stopped.len().to_string().bold()
+                );
                 for id in &result.already_stopped {
-                    println!("  Node {id}");
+                    println!("  {} Node {}", "─".dimmed(), id.to_string().dimmed());
                 }
             }
             if !result.failed.is_empty() {
-                println!("Failed to stop {} node(s):", result.failed.len());
+                println!(
+                    "{} Failed to stop {} node(s):",
+                    "✗".red().bold(),
+                    result.failed.len().to_string().bold()
+                );
                 for fail in &result.failed {
                     println!(
-                        "  {} ({}) — {}",
-                        fail.service_name, fail.node_id, fail.error
+                        "  {} {} ({}) — {}",
+                        "●".red(),
+                        fail.service_name.bold(),
+                        fail.node_id.to_string().dimmed(),
+                        fail.error.red()
                     );
                 }
             }
@@ -80,7 +106,11 @@ impl StopArgs {
                 && result.already_stopped.is_empty()
                 && result.failed.is_empty()
             {
-                println!("No nodes registered. Add nodes first with: ant node add");
+                println!(
+                    "{} No nodes registered. Add nodes first with: {}",
+                    "●".yellow(),
+                    "ant node add".cyan()
+                );
             }
         }
 

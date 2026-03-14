@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 
 use clap::Args;
+use colored::Colorize;
 
 use ant_core::node::daemon::client;
 use ant_core::node::types::{DaemonConfig, ResetResult};
@@ -34,14 +35,14 @@ impl ResetArgs {
         // Prompt for confirmation unless --force
         if !self.force && !json_output {
             print!(
-                "This will remove all node data directories, log directories, and clear the \
-                 registry.\nAre you sure? [y/N] "
+                "{} This will remove all node data, logs, and clear the registry.\n  Are you sure? [y/N] ",
+                "⚠".yellow().bold()
             );
             io::stdout().flush()?;
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
             if !input.trim().eq_ignore_ascii_case("y") {
-                println!("Reset cancelled.");
+                println!("{} Reset cancelled.", "─".dimmed());
                 return Ok(());
             }
         }
@@ -55,15 +56,29 @@ impl ResetArgs {
         if json_output {
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else if result.nodes_cleared == 0 {
-            println!("No nodes to reset. Registry is already empty.");
+            println!(
+                "{} No nodes to reset — registry is already empty.",
+                "●".yellow()
+            );
         } else {
-            println!("Reset complete:");
-            println!("  Nodes cleared: {}", result.nodes_cleared);
+            println!(
+                "{} Reset complete — {} node(s) cleared",
+                "✓".green().bold(),
+                result.nodes_cleared.to_string().bold()
+            );
             for dir in &result.data_dirs_removed {
-                println!("  Removed data dir: {}", dir.display());
+                println!(
+                    "  {} Removed data: {}",
+                    "─".dimmed(),
+                    dir.display().to_string().dimmed()
+                );
             }
             for dir in &result.log_dirs_removed {
-                println!("  Removed log dir:  {}", dir.display());
+                println!(
+                    "  {} Removed logs: {}",
+                    "─".dimmed(),
+                    dir.display().to_string().dimmed()
+                );
             }
         }
 
