@@ -507,16 +507,22 @@ fn send_signal_term(pid: u32) {
     };
 
     unsafe {
-        // Detach from our own console so we don't kill ourselves
+        // Detach from our own console (no-op if daemon has none, which is
+        // typical since it's spawned with DETACHED_PROCESS).
         FreeConsole();
 
         // Attach to the target process's console and send Ctrl+C
         if AttachConsole(pid) != 0 {
-            // Disable our own handler so we don't terminate
+            // Permanently disable Ctrl+C handling in the daemon process.
+            // GenerateConsoleCtrlEvent is asynchronous — it dispatches to a
+            // separate handler thread that checks the ignore flag whenever it
+            // wakes up. Re-enabling the handler after sending the event creates
+            // an unwinnable race: the handler thread can wake up after the flag
+            // is cleared and terminate the daemon. Since the daemon is a
+            // background process that uses CancellationToken for shutdown, it
+            // never needs to respond to Ctrl+C.
             SetConsoleCtrlHandler(None, 1);
             GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
-            // Re-enable our handler and detach
-            SetConsoleCtrlHandler(None, 0);
             FreeConsole();
         }
     }
