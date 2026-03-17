@@ -126,6 +126,8 @@ async fn fetch_latest_version() -> Result<String> {
 }
 
 /// Download an archive from a URL, extract the binary, and cache it.
+///
+/// Streams the download to a temporary file to avoid unbounded memory usage.
 async fn download_and_extract(
     url: &str,
     install_dir: &Path,
@@ -151,21 +153,30 @@ async fn download_and_extract(
 
     let total_size = resp.content_length().unwrap_or(0);
     let mut downloaded: u64 = 0;
-    let mut bytes = Vec::new();
+
+    // Stream to a temp file to avoid holding the entire archive in memory
+    std::fs::create_dir_all(install_dir)?;
+    let tmp_path = install_dir.join(".download.tmp");
+    let mut tmp_file = std::fs::File::create(&tmp_path)
+        .map_err(|e| Error::BinaryResolution(format!("failed to create temp file: {e}")))?;
 
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|e| Error::BinaryResolution(format!("download stream error: {e}")))?;
         downloaded += chunk.len() as u64;
-        bytes.extend_from_slice(&chunk);
+        std::io::Write::write_all(&mut tmp_file, &chunk)
+            .map_err(|e| Error::BinaryResolution(format!("failed to write temp file: {e}")))?;
         progress.report_progress(downloaded, total_size);
     }
+    drop(tmp_file);
 
     progress.report_started("Extracting archive...");
 
-    // Create install dir
-    std::fs::create_dir_all(install_dir)?;
+    // Read the temp file for extraction
+    let bytes = std::fs::read(&tmp_path)
+        .map_err(|e| Error::BinaryResolution(format!("failed to read temp file: {e}")))?;
+    let _ = std::fs::remove_file(&tmp_path);
 
     // Extract based on file extension
     let binary_path = if url.ends_with(".zip") {
