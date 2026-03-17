@@ -7,20 +7,23 @@ use ant_core::node::types::{AddNodeOpts, BinarySource, PortRange};
 
 const TEST_ADDR: &str = "0x1234567890abcdef1234567890abcdef12345678";
 
-/// Create a fake binary that responds to --version
+/// Create a fake binary that responds to --version.
+/// On Windows, uses a .cmd extension so the shell can execute it.
 fn create_fake_binary(dir: &std::path::Path) -> PathBuf {
-    let binary_path = dir.join("fake-antnode");
     #[cfg(unix)]
     {
+        let binary_path = dir.join("fake-antnode");
         std::fs::write(&binary_path, "#!/bin/sh\necho \"antnode 0.1.0-test\"\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binary_path
     }
     #[cfg(windows)]
     {
-        std::fs::write(&binary_path, "@echo antnode 0.1.0-test\n").unwrap();
+        let binary_path = dir.join("fake-antnode.cmd");
+        std::fs::write(&binary_path, "@echo off\r\necho antnode 0.1.0-test\r\n").unwrap();
+        binary_path
     }
-    binary_path
 }
 
 #[tokio::test]

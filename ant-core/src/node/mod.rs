@@ -98,7 +98,7 @@ pub async fn add_nodes(
         let assigned_id = registry.add(config);
 
         // Now update paths with the actual assigned ID
-        let node = registry.nodes.get_mut(&assigned_id).unwrap();
+        let node = registry.get_mut(assigned_id)?;
         node.data_dir = node_data_dir(&opts.data_dir_path, assigned_id);
         node.log_dir = node_log_dir(&opts.log_dir_path, assigned_id);
 
@@ -267,20 +267,23 @@ mod tests {
         dir.join("node_registry.json")
     }
 
-    /// Create a fake binary that responds to --version
+    /// Create a fake binary that responds to --version.
+    /// On Windows, uses a .cmd extension so the shell can execute it.
     fn create_fake_binary(dir: &std::path::Path) -> PathBuf {
-        let binary_path = dir.join("fake-antnode");
         #[cfg(unix)]
         {
+            let binary_path = dir.join("fake-antnode");
             std::fs::write(&binary_path, "#!/bin/sh\necho \"antnode 0.1.0-test\"\n").unwrap();
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            binary_path
         }
         #[cfg(windows)]
         {
-            std::fs::write(&binary_path, "@echo antnode 0.1.0-test\n").unwrap();
+            let binary_path = dir.join("fake-antnode.cmd");
+            std::fs::write(&binary_path, "@echo off\r\necho antnode 0.1.0-test\r\n").unwrap();
+            binary_path
         }
-        binary_path
     }
 
     #[tokio::test]

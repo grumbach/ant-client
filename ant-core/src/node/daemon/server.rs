@@ -454,7 +454,8 @@ async fn post_reset(
 }
 
 async fn get_openapi() -> impl IntoResponse {
-    // Minimal OpenAPI 3.1 spec - will be expanded with utoipa as endpoints grow
+    // TODO: Migrate to utoipa-generated OpenAPI spec. Types already derive
+    // utoipa::ToSchema but this spec is still hand-written JSON.
     let spec = serde_json::json!({
         "openapi": "3.1.0",
         "info": {

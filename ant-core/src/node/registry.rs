@@ -12,7 +12,7 @@ use crate::node::types::NodeConfig;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRegistry {
     pub schema_version: u32,
-    pub nodes: HashMap<u32, NodeConfig>,
+    pub(crate) nodes: HashMap<u32, NodeConfig>,
     pub next_id: u32,
     /// Path where this registry is persisted. Not serialized.
     #[serde(skip)]
@@ -73,6 +73,11 @@ impl NodeRegistry {
     /// Get a node by ID.
     pub fn get(&self, id: u32) -> Result<&NodeConfig> {
         self.nodes.get(&id).ok_or(Error::NodeNotFound(id))
+    }
+
+    /// Get a mutable reference to a node by ID.
+    pub fn get_mut(&mut self, id: u32) -> Result<&mut NodeConfig> {
+        self.nodes.get_mut(&id).ok_or(Error::NodeNotFound(id))
     }
 
     /// Add a node and return its assigned ID.
