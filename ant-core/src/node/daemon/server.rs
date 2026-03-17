@@ -31,6 +31,8 @@ pub struct AppState {
     pub event_tx: broadcast::Sender<NodeEvent>,
     pub start_time: Instant,
     pub config: DaemonConfig,
+    /// The actual address the server bound to (resolves port 0 to real port).
+    pub bound_port: u16,
 }
 
 /// Start the daemon HTTP server.
@@ -43,16 +45,6 @@ pub async fn start(
 ) -> Result<SocketAddr> {
     let (event_tx, _) = broadcast::channel(256);
 
-    let state = Arc::new(AppState {
-        registry: RwLock::new(registry),
-        supervisor: Arc::new(RwLock::new(Supervisor::new(event_tx.clone()))),
-        event_tx,
-        start_time: Instant::now(),
-        config: config.clone(),
-    });
-
-    let app = build_router(state.clone());
-
     let addr = SocketAddr::new(config.listen_addr, config.port.unwrap_or(0));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -60,6 +52,17 @@ pub async fn start(
     let bound_addr = listener
         .local_addr()
         .map_err(|e| crate::error::Error::BindError(e.to_string()))?;
+
+    let state = Arc::new(AppState {
+        registry: RwLock::new(registry),
+        supervisor: Arc::new(RwLock::new(Supervisor::new(event_tx.clone()))),
+        event_tx,
+        start_time: Instant::now(),
+        config: config.clone(),
+        bound_port: bound_addr.port(),
+    });
+
+    let app = build_router(state.clone());
 
     // Write port and PID files
     write_file(&config.port_file_path, &bound_addr.port().to_string())?;
@@ -107,7 +110,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<DaemonStatus> {
     Json(DaemonStatus {
         running: true,
         pid: Some(std::process::id()),
-        port: Some(state.config.port.unwrap_or(0)),
+        port: Some(state.bound_port),
         uptime_secs: Some(state.start_time.elapsed().as_secs()),
         nodes_total: registry.len() as u32,
         nodes_running: running,
