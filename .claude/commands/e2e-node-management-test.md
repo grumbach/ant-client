@@ -187,11 +187,16 @@ Verify: response contains HTML (check for `<html` or `<!DOCTYPE`).
 
 **Step 7.5 — CORS headers:**
 
+CORS is restricted to the daemon's own localhost origin. Use the daemon's actual port (from Step 5.3)
+when sending the Origin header:
+
 ```bash
-curl -s -I -X OPTIONS -H "Origin: http://example.com" -H "Access-Control-Request-Method: GET" <api_base>/status
+curl -s -I -X OPTIONS -H "Origin: http://127.0.0.1:<port>" -H "Access-Control-Request-Method: GET" <api_base>/status
 ```
 
-Verify: response includes `access-control-allow-origin` header (case-insensitive check).
+Verify: response includes `access-control-allow-origin: http://127.0.0.1:<port>` header
+(case-insensitive check). A cross-origin request (e.g., `Origin: http://example.com`) should NOT
+receive this header.
 
 ### Phase 8: Cleanup
 
