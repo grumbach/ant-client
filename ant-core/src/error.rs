@@ -53,6 +53,9 @@ pub enum Error {
     #[error("Failed to stop daemon: {0}")]
     DaemonStopFailed(String),
 
+    #[error("Could not determine home directory (HOME/USERPROFILE not set)")]
+    HomeDirNotFound,
+
     #[error(
         "Cannot reset while nodes are running ({0} node(s) still running). Stop all nodes first."
     )]

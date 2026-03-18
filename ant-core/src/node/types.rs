@@ -26,8 +26,8 @@ pub struct DaemonConfig {
 
 impl Default for DaemonConfig {
     fn default() -> Self {
-        let data = config::data_dir();
-        let logs = config::log_dir();
+        let data = config::data_dir().expect("Could not determine data directory");
+        let logs = config::log_dir().expect("Could not determine log directory");
         Self {
             listen_addr: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             port: None,

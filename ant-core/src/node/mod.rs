@@ -56,7 +56,7 @@ pub async fn add_nodes(
     }
 
     // Resolve the binary (downloads to cache if needed)
-    let install_dir = binary::binary_install_dir();
+    let install_dir = binary::binary_install_dir()?;
     let (cached_binary, version) =
         binary::resolve_binary(&opts.binary_source, &install_dir, progress).await?;
 
@@ -236,6 +236,7 @@ fn node_data_dir(custom_prefix: &Option<PathBuf>, node_id: u32) -> PathBuf {
     match custom_prefix {
         Some(prefix) => prefix.join(format!("node-{node_id}")),
         None => config::data_dir()
+            .expect("Could not determine data directory")
             .join("nodes")
             .join(format!("node-{node_id}")),
     }

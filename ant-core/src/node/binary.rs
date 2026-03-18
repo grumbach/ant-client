@@ -369,8 +369,8 @@ fn platform_asset_name() -> Result<String> {
 }
 
 /// Returns the directory where downloaded binaries are cached.
-pub fn binary_install_dir() -> PathBuf {
-    crate::config::data_dir().join("bin")
+pub fn binary_install_dir() -> crate::error::Result<PathBuf> {
+    Ok(crate::config::data_dir()?.join("bin"))
 }
 
 #[cfg(test)]
