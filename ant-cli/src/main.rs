@@ -16,7 +16,23 @@ use ant_core::data::{
 use cli::{Cli, Commands};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    let code = match run().await {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            1
+        }
+    };
+
+    // Force-exit to avoid hanging on tokio runtime shutdown.
+    // Open QUIC connections and pending background tasks (DHT, keep-alive)
+    // block the runtime's graceful shutdown indefinitely. All data has been
+    // persisted / printed by this point, so there is nothing left to clean up.
+    std::process::exit(code);
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Initialize tracing for data commands (node commands handle their own output)
