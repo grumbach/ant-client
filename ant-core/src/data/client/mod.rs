@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::debug;
 
+/// Default timeout for network operations in seconds.
+const CLIENT_TIMEOUT_SECS: u64 = 30;
+
 /// Configuration for the Autonomi client.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -34,7 +37,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            timeout_secs: 30,
+            timeout_secs: CLIENT_TIMEOUT_SECS,
             close_group_size: CLOSE_GROUP_SIZE,
         }
     }
