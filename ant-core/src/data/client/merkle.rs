@@ -1,4 +1,4 @@
-//! Merkle batch payment support for the saorsa client.
+//! Merkle batch payment support for the Autonomi client.
 //!
 //! When uploading batches of 64+ chunks, merkle payments reduce gas costs
 //! by paying for the entire batch in a single on-chain transaction instead
@@ -10,14 +10,14 @@ use ant_evm::merkle_payments::{
     MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
     MidpointProof, CANDIDATES_PER_POOL, MAX_LEAVES,
 };
-use evmlib::merkle_batch_payment::PoolCommitment;
-use futures::stream::{FuturesUnordered, StreamExt};
-use saorsa_node::ant_protocol::{
+use ant_node::ant_protocol::{
     ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
 };
-use saorsa_node::client::send_and_await_chunk_response;
-use saorsa_node::payment::quote::verify_merkle_candidate_signature;
-use saorsa_node::payment::serialize_merkle_proof;
+use ant_node::client::send_and_await_chunk_response;
+use ant_node::payment::quote::verify_merkle_candidate_signature;
+use ant_node::payment::serialize_merkle_proof;
+use evmlib::merkle_batch_payment::PoolCommitment;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -334,6 +334,7 @@ impl Client {
                     message_bytes,
                     request_id,
                     timeout,
+                    &[],
                     |body| match body {
                         ChunkMessageBody::MerkleCandidateQuoteResponse(
                             MerkleCandidateQuoteResponse::Success { candidate_node },
@@ -387,7 +388,7 @@ impl Client {
         futures: &mut FuturesUnordered<
             impl std::future::Future<
                 Output = (
-                    saorsa_node::core::PeerId,
+                    ant_node::core::PeerId,
                     std::result::Result<MerklePaymentCandidateNode, Error>,
                 ),
             >,
@@ -570,7 +571,7 @@ mod tests {
         use ant_evm::merkle_payments::MerklePaymentCandidateNode;
         use ant_evm::QuotingMetrics;
         use ant_evm::RewardsAddress;
-        use saorsa_node::payment::{deserialize_merkle_proof, serialize_merkle_proof};
+        use ant_node::payment::{deserialize_merkle_proof, serialize_merkle_proof};
 
         let addrs = make_test_addresses(4);
         let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();

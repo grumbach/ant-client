@@ -8,11 +8,11 @@
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+use ant_node::ant_protocol::DATA_TYPE_CHUNK;
+use ant_node::client::compute_address;
 use bytes::Bytes;
 use futures::stream;
 use futures::StreamExt;
-use saorsa_node::ant_protocol::DATA_TYPE_CHUNK;
-use saorsa_node::client::compute_address;
 use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -358,10 +358,7 @@ impl Client {
         // Write decrypted chunks to a temp file, then rename atomically.
         let parent = output.parent().unwrap_or_else(|| Path::new("."));
         let unique: u64 = rand::random();
-        let tmp_path = parent.join(format!(
-            ".saorsa_download_{}_{unique}.tmp",
-            std::process::id()
-        ));
+        let tmp_path = parent.join(format!(".ant_download_{}_{unique}.tmp", std::process::id()));
 
         let write_result = (|| -> Result<u64> {
             let mut file = std::fs::File::create(&tmp_path)?;

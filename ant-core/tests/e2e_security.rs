@@ -1,4 +1,4 @@
-//! Security attack tests for saorsa-client.
+//! Security attack tests for ant-core.
 //!
 //! Each test sets up a `MiniTestnet`, collects real quotes, tampers with the
 //! proof in a specific way, and asserts the attack is REJECTED by the network.
@@ -9,11 +9,11 @@ mod support;
 
 use ant_core::data::{compute_address, Client, ClientConfig};
 use ant_evm::ProofOfPayment;
+use ant_node::client::hex_node_id_to_encoded_peer_id;
+use ant_node::core::PeerId;
+use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
 use evmlib::common::TxHash;
-use saorsa_node::client::hex_node_id_to_encoded_peer_id;
-use saorsa_node::core::PeerId;
-use saorsa_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use serial_test::serial;
 use std::sync::Arc;
 use support::MiniTestnet;

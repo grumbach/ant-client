@@ -30,7 +30,7 @@ async fn setup() -> (Client, MiniTestnet) {
 async fn test_chunk_put_get_round_trip() {
     let (client, testnet) = setup().await;
 
-    let content = Bytes::from("saorsa-client chunk e2e test payload");
+    let content = Bytes::from("ant-core chunk e2e test payload");
     let address = client
         .chunk_put(content.clone())
         .await

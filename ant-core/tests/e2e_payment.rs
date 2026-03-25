@@ -1,4 +1,4 @@
-//! Payment flow E2E tests for saorsa-client.
+//! Payment flow E2E tests for ant-core.
 //!
 //! Tests legitimate payment flows: paid chunk storage, concurrent uploads,
 //! payment enforcement, large chunks, idempotency, and quote collection.

@@ -1,4 +1,4 @@
-//! Payment orchestration for the saorsa client.
+//! Payment orchestration for the Autonomi client.
 //!
 //! Connects quote collection, on-chain EVM payment, and proof serialization.
 //! Every PUT to the network requires a valid payment proof.
@@ -6,10 +6,10 @@
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_evm::{EncodedPeerId, ProofOfPayment};
+use ant_node::client::hex_node_id_to_encoded_peer_id;
+use ant_node::core::PeerId;
+use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use evmlib::wallet::Wallet;
-use saorsa_node::client::hex_node_id_to_encoded_peer_id;
-use saorsa_node::core::PeerId;
-use saorsa_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -154,7 +154,7 @@ impl Client {
     }
 }
 
-/// Convert a saorsa-core `PeerId` to an `EncodedPeerId` for payment proofs.
+/// Convert an ant-node `PeerId` to an `EncodedPeerId` for payment proofs.
 fn peer_id_to_encoded(peer_id: &PeerId) -> Result<EncodedPeerId> {
     hex_node_id_to_encoded_peer_id(&peer_id.to_hex())
         .map_err(|e| Error::Payment(format!("Failed to encode peer ID: {e}")))
