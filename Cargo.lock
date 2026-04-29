@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.2.1-rc.1"
+version = "0.2.1-rc.2"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.2.1-rc.1"
+version = "0.2.1-rc.2"
 dependencies = [
  "alloy",
  "ant-node",
@@ -955,8 +955,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.0.2-rc.1"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.4.3#3969b9142dda458b8ac5c8b0b8ea4cc64acd6337"
+version = "2.0.2-rc.2"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.4.3#f306085b339238074d90af5d7dbaca4a146b211a"
 dependencies = [
  "blake3",
  "bytes",
@@ -964,7 +964,7 @@ dependencies = [
  "hex",
  "postcard",
  "rmp-serde",
- "saorsa-core 0.24.1-rc.1",
+ "saorsa-core 0.24.1-rc.2",
  "saorsa-pqc 0.5.1",
  "serde",
  "tokio",
@@ -5047,9 +5047,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.39"
+version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
+checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -5238,8 +5238,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.24.1-rc.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.4.3#a477a171b125b8bd6da980a705ad047cc0ceb4e2"
+version = "0.24.1-rc.2"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.4.3#3270d115c985a6ed1dec6b41a81693b1955cc6f4"
 dependencies = [
  "anyhow",
  "async-trait",
