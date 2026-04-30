@@ -6,6 +6,7 @@
 
 use crate::data::client::adaptive::observe_op;
 use crate::data::client::classify_error;
+use crate::data::client::file::UploadEvent;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{
@@ -22,6 +23,7 @@ use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use xor_name::XorName;
 
@@ -443,11 +445,20 @@ impl Client {
             candidate_futures.push(fut);
         }
 
-        self.collect_validated_candidates(&mut candidate_futures, merkle_payment_timestamp)
+        self.collect_validated_candidates(&mut candidate_futures, address, merkle_payment_timestamp)
             .await
     }
 
-    /// Collect and validate merkle candidate responses until we have enough.
+    /// Collect and validate merkle candidate responses, then return the
+    /// `CANDIDATES_PER_POOL` valid responders that are XOR-closest to the
+    /// pool midpoint.
+    ///
+    /// Why distance-sort instead of "first N to respond":
+    /// the storing-node verifier re-runs a network closest-peers lookup of
+    /// the pool midpoint and rejects the pool if fewer than 13 of the 16
+    /// candidate `pub_keys` appear in that authoritative close-set. Pools
+    /// built from the fastest-to-respond quoters fail this check whenever
+    /// truly-close peers are slower (NAT/relay paths) than farther peers.
     async fn collect_validated_candidates(
         &self,
         futures: &mut FuturesUnordered<
@@ -458,9 +469,10 @@ impl Client {
                 ),
             >,
         >,
+        target_address: &[u8; 32],
         merkle_payment_timestamp: u64,
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
-        let mut candidates = Vec::with_capacity(CANDIDATES_PER_POOL);
+        let mut valid: Vec<(PeerId, MerklePaymentCandidateNode)> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
 
         while let Some((peer_id, result)) = futures.next().await {
@@ -476,10 +488,7 @@ impl Client {
                         failures.push(format!("{peer_id}: timestamp mismatch"));
                         continue;
                     }
-                    candidates.push(candidate);
-                    if candidates.len() >= CANDIDATES_PER_POOL {
-                        break;
-                    }
+                    valid.push((peer_id, candidate));
                 }
                 Err(e) => {
                     debug!("Failed to get merkle candidate from {peer_id}: {e}");
@@ -488,15 +497,23 @@ impl Client {
             }
         }
 
-        if candidates.len() < CANDIDATES_PER_POOL {
+        if valid.len() < CANDIDATES_PER_POOL {
             return Err(Error::InsufficientPeers(format!(
                 "Got {} merkle candidates, need {CANDIDATES_PER_POOL}. Failures: [{}]",
-                candidates.len(),
+                valid.len(),
                 failures.join("; ")
             )));
         }
 
-        candidates.truncate(CANDIDATES_PER_POOL);
+        let target_peer = PeerId::from_bytes(*target_address);
+        valid.sort_by_key(|(peer_id, _)| peer_id.xor_distance(&target_peer));
+
+        let candidates: Vec<MerklePaymentCandidateNode> = valid
+            .into_iter()
+            .take(CANDIDATES_PER_POOL)
+            .map(|(_, candidate)| candidate)
+            .collect();
+
         candidates
             .try_into()
             .map_err(|_| Error::Payment("Failed to convert candidates to fixed array".to_string()))
@@ -516,6 +533,7 @@ impl Client {
         chunk_contents: Vec<Bytes>,
         addresses: Vec<[u8; 32]>,
         batch_result: &MerkleBatchPaymentResult,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
     ) -> Result<usize> {
         let mut stored = 0usize;
         let store_limiter = self.controller().store.clone();
@@ -551,6 +569,12 @@ impl Client {
         while let Some(result) = upload_stream.next().await {
             result?;
             stored += 1;
+            if let Some(tx) = progress {
+                let _ = tx.try_send(UploadEvent::ChunkStored {
+                    stored,
+                    total: batch_size,
+                });
+            }
         }
 
         Ok(stored)
@@ -628,7 +652,7 @@ mod send_assertions {
     )]
     async fn _merkle_upload_chunks_is_send(client: &Client) {
         let batch_result: MerkleBatchPaymentResult = todo!();
-        let fut = client.merkle_upload_chunks(Vec::new(), Vec::new(), &batch_result);
+        let fut = client.merkle_upload_chunks(Vec::new(), Vec::new(), &batch_result, None);
         _assert_send(&fut);
     }
 }
