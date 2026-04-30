@@ -59,6 +59,56 @@ fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
     compute_address(&quote.pub_key) == *peer_id.as_bytes()
 }
 
+/// Classification of a `ChunkQuoteResponse::Success` body for a single peer.
+///
+/// The per-peer handler in `get_store_quotes` runs this classifier on every
+/// response *before* committing to a payment. Pulling the logic out of the
+/// async closure lets us unit-test the primary defense (not just the post-
+/// collect defensive filter).
+///
+/// # Returns
+///
+/// - `Ok((quote, price))` — the response is honoured as a quote.
+/// - `Err(Error::AlreadyStored)` — the peer claims the chunk is already
+///   present AND the quote it provided binds to its peer ID. Vote counts.
+/// - `Err(Error::BadQuoteBinding { .. })` — bad binding (mirrors the
+///   storer-side rejection); the peer is treated as a failure so the AIMD
+///   cache learns to deprioritize it. Outer collector counts these via the
+///   typed variant (no string matching).
+/// - `Err(Error::Serialization(...))` — the quote bytes did not deserialize.
+fn classify_quote_response(
+    peer_id: &PeerId,
+    quote_bytes: &[u8],
+    already_stored: bool,
+) -> std::result::Result<(PaymentQuote, Amount), Error> {
+    let payment_quote = rmp_serde::from_slice::<PaymentQuote>(quote_bytes).map_err(|e| {
+        Error::Serialization(format!("Failed to deserialize quote from {peer_id}: {e}"))
+    })?;
+    if !quote_binding_is_valid(peer_id, &payment_quote) {
+        let derived = compute_address(&payment_quote.pub_key);
+        warn!(
+            "Dropping response from {peer_id} — quote.pub_key BLAKE3 mismatch \
+             (peer is signing quotes with another peer's key); the storer \
+             would reject this proof"
+        );
+        return Err(Error::BadQuoteBinding {
+            peer_id: peer_id.to_string(),
+            detail: format!(
+                "BLAKE3(pub_key)={} pub_key_len={}",
+                hex::encode(derived),
+                payment_quote.pub_key.len(),
+            ),
+        });
+    }
+    if already_stored {
+        debug!("Peer {peer_id} already has chunk");
+        return Err(Error::AlreadyStored);
+    }
+    let price = payment_quote.price;
+    debug!("Received quote from {peer_id}: price = {price}");
+    Ok((payment_quote, price))
+}
+
 /// Drop quotes whose `pub_key` does not BLAKE3-hash to the peer that supplied
 /// them. Logs each dropped quote at WARN.
 fn drop_quotes_with_bad_bindings(
@@ -167,38 +217,11 @@ impl Client {
                         ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
                             quote,
                             already_stored,
-                        }) => {
-                            // Deserialize the quote first — bind-check it before
-                            // honouring the `already_stored` vote, otherwise a peer
-                            // with a crossed signing key could still skew the
-                            // close-group "already stored" majority decision.
-                            let payment_quote = match rmp_serde::from_slice::<PaymentQuote>(&quote)
-                            {
-                                Ok(q) => q,
-                                Err(e) => {
-                                    return Some(Err(Error::Serialization(format!(
-                                        "Failed to deserialize quote from {peer_id_clone}: {e}"
-                                    ))));
-                                }
-                            };
-                            if !quote_binding_is_valid(&peer_id_clone, &payment_quote) {
-                                warn!(
-                                    "Dropping response from {peer_id_clone} \
-                                     — quote.pub_key BLAKE3 mismatch (peer is signing with \
-                                     another peer's key); the storer would reject this proof"
-                                );
-                                return Some(Err(Error::Protocol(format!(
-                                    "Bad quote binding from {peer_id_clone}"
-                                ))));
-                            }
-                            if already_stored {
-                                debug!("Peer {peer_id_clone} already has chunk");
-                                return Some(Err(Error::AlreadyStored));
-                            }
-                            let price = payment_quote.price;
-                            debug!("Received quote from {peer_id_clone}: price = {price}");
-                            Some(Ok((payment_quote, price)))
-                        }
+                        }) => Some(classify_quote_response(
+                            &peer_id_clone,
+                            &quote,
+                            already_stored,
+                        )),
                         ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
                             Error::Protocol(format!("Quote error from {peer_id_clone}: {e}")),
                         )),
@@ -216,7 +239,9 @@ impl Client {
                 // Record the per-peer outcome for the AIMD bootstrap cache.
                 // A bad-binding response is treated as a failure so the local
                 // peer cache learns to deprioritize misbehaving peers and we
-                // don't keep re-asking them on every upload.
+                // don't keep re-asking them on every upload. AlreadyStored is
+                // a benign outcome (peer is reachable and well-behaved), so
+                // we count it as success.
                 let success = matches!(&result, Ok(_) | Err(Error::AlreadyStored));
                 let rtt_ms = success.then(|| start.elapsed().as_millis() as u64);
                 record_peer_outcome(&node_clone, peer_id_clone, &addrs_clone, success, rtt_ms)
@@ -252,12 +277,10 @@ impl Client {
                             already_stored_peers.push((peer_id, dist));
                         }
                         Err(e) => {
-                            // The per-peer handler emits this error string for
-                            // bad-binding responses. Detect and count separately
-                            // for the diagnostics; otherwise treat as a normal
-                            // failure for InsufficientPeers reporting.
-                            let msg = e.to_string();
-                            if msg.contains("Bad quote binding") {
+                            // Count bad bindings separately (typed variant —
+                            // no string sniffing). Treat as a normal failure
+                            // for InsufficientPeers reporting otherwise.
+                            if matches!(&e, Error::BadQuoteBinding { .. }) {
                                 bad_binding_count += 1;
                             }
                             warn!("Failed to get quote from {peer_id}: {e}");
@@ -680,6 +703,138 @@ mod tests {
         // Sanity: every survivor is storer-acceptable.
         for (peer_id, _, quote, _) in &quotes {
             assert!(storer_would_accept(peer_id, quote));
+        }
+    }
+
+    // ============================================================
+    // Tests for the per-peer response classifier (the PRIMARY defense).
+    //
+    // These tests exercise the production code path that runs inside
+    // get_store_quotes' per-peer async closure. The defensive
+    // `drop_quotes_with_bad_bindings` is a second line of defence —
+    // these tests make sure the FIRST line is what actually catches
+    // misbehaving peers in production. Without these, a regression
+    // that removes the per-peer check could be masked by the post-
+    // collect filter and pass the rest of the suite.
+    // ============================================================
+
+    /// Helper: serialize a `PaymentQuote` to bytes the way the wire layer
+    /// does (rmp_serde / msgpack), to feed into `classify_quote_response`.
+    fn serialize_quote(quote: &PaymentQuote) -> Vec<u8> {
+        rmp_serde::to_vec(quote).expect("serialize quote")
+    }
+
+    #[test]
+    fn classifier_accepts_real_self_consistent_quote() {
+        let (peer_id, _, quote, _) = good_quote_real();
+        let bytes = serialize_quote(&quote);
+        let result = classify_quote_response(&peer_id, &bytes, false);
+        match result {
+            Ok((q, price)) => {
+                assert_eq!(q.pub_key, quote.pub_key);
+                assert_eq!(price, quote.price);
+            }
+            Err(e) => panic!("expected Ok, got {e}"),
+        }
+    }
+
+    #[test]
+    fn classifier_rejects_crossed_keypair_with_typed_error() {
+        let (peer_id, _, quote, _) = bad_quote_real();
+        let bytes = serialize_quote(&quote);
+        let result = classify_quote_response(&peer_id, &bytes, false);
+        match result {
+            Err(Error::BadQuoteBinding {
+                peer_id: pid,
+                detail,
+            }) => {
+                assert_eq!(pid, peer_id.to_string());
+                assert!(
+                    detail.contains("BLAKE3(pub_key)="),
+                    "diagnostic detail must include the derived peer id: {detail}"
+                );
+            }
+            other => panic!("expected BadQuoteBinding for crossed-key quote, got {other:?}"),
+        }
+    }
+
+    /// CRITICAL: a misbehaving peer that votes `already_stored=true` must
+    /// NOT be allowed to influence the close-group "already stored"
+    /// majority decision. The bind-check runs before the AlreadyStored
+    /// short-circuit, so a crossed-key peer voting "already stored" is
+    /// classified as `BadQuoteBinding`, not `AlreadyStored`.
+    ///
+    /// This locks in a specific reviewer concern from round 1:
+    ///   "A peer with a crossed/garbage signing key could simply respond
+    ///   already_stored=true and its vote enters already_stored_peers
+    ///   unfiltered."
+    #[test]
+    fn classifier_rejects_already_stored_vote_from_bad_binding_peer() {
+        let (peer_id, _, quote, _) = bad_quote_real();
+        let bytes = serialize_quote(&quote);
+        // The peer claims already_stored=true, but its quote has a crossed key.
+        let result = classify_quote_response(&peer_id, &bytes, true);
+        assert!(
+            matches!(result, Err(Error::BadQuoteBinding { .. })),
+            "crossed-key peer must be classified BadQuoteBinding even when \
+             voting already_stored=true; got {result:?}"
+        );
+    }
+
+    /// An honest peer's `already_stored=true` vote IS honoured (after
+    /// passing the bind-check). This is the contrast to the test above.
+    #[test]
+    fn classifier_honours_already_stored_vote_from_good_binding_peer() {
+        let (peer_id, _, quote, _) = good_quote_real();
+        let bytes = serialize_quote(&quote);
+        let result = classify_quote_response(&peer_id, &bytes, true);
+        assert!(
+            matches!(result, Err(Error::AlreadyStored)),
+            "honest peer's already_stored vote must be honoured; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn classifier_returns_serialization_error_on_bad_bytes() {
+        let (peer_id, _, _, _) = good_quote_real();
+        let garbage = b"this is not a valid msgpack PaymentQuote".to_vec();
+        let result = classify_quote_response(&peer_id, &garbage, false);
+        assert!(
+            matches!(result, Err(Error::Serialization(_))),
+            "garbage bytes must produce a Serialization error; got {result:?}"
+        );
+    }
+
+    /// Independent attestation: round-trip a "would be rejected by storer"
+    /// quote through the classifier and confirm the classifier's verdict
+    /// matches the storer's spec verdict. If they ever disagree, either
+    /// the classifier is letting through a quote the storer will reject
+    /// (money-loss regression), or it's filtering a quote the storer
+    /// would have accepted (availability regression). Both are bugs.
+    #[test]
+    fn classifier_verdict_matches_storer_spec_for_full_responder_set() {
+        // 12 honest + 4 crossed-key responders.
+        let mut responders: Vec<(PeerId, PaymentQuote)> = (0..12)
+            .map(|_| {
+                let (p, _, q, _) = good_quote_real();
+                (p, q)
+            })
+            .collect();
+        for _ in 0..4 {
+            let (p, _, q, _) = bad_quote_real();
+            responders.push((p, q));
+        }
+
+        for (peer_id, quote) in &responders {
+            let bytes = serialize_quote(quote);
+            let storer_verdict = storer_would_accept(peer_id, quote);
+            let classifier_verdict = classify_quote_response(peer_id, &bytes, false).is_ok();
+            assert_eq!(
+                classifier_verdict, storer_verdict,
+                "classifier and storer-spec must agree on every responder \
+                 (peer_id={}, storer={storer_verdict}, classifier={classifier_verdict})",
+                peer_id
+            );
         }
     }
 }
