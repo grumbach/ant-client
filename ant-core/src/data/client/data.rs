@@ -9,7 +9,7 @@
 use crate::data::client::adaptive::{observe_op, rebucketed_ordered};
 use crate::data::client::batch::{PaymentIntent, PreparedChunk};
 use crate::data::client::classify_error;
-use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload};
+use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload, Visibility};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -153,31 +153,81 @@ impl Client {
 
     /// Phase 1 of external-signer data upload: encrypt and collect quotes.
     ///
+    /// Equivalent to [`Client::data_prepare_upload_with_visibility`] with
+    /// [`Visibility::Private`] — see that method for details.
+    pub async fn data_prepare_upload(&self, content: Bytes) -> Result<PreparedUpload> {
+        self.data_prepare_upload_with_visibility(content, Visibility::Private)
+            .await
+    }
+
+    /// Phase 1 of external-signer data upload with explicit [`Visibility`] control.
+    ///
     /// Encrypts in-memory data via self-encryption, then collects storage
     /// quotes for each chunk without making any on-chain payment. Returns
     /// a [`PreparedUpload`] containing the data map and a [`PaymentIntent`]
     /// with the payment details for external signing.
+    ///
+    /// When `visibility` is [`Visibility::Public`], the serialized `DataMap`
+    /// is bundled into the payment batch as an additional chunk and its
+    /// address is recorded on the returned [`PreparedUpload`]. After
+    /// [`Client::finalize_upload`] succeeds, that address is surfaced via
+    /// [`crate::data::client::file::FileUploadResult::data_map_address`] so
+    /// the uploader can share a single address from which anyone can retrieve
+    /// the data.
+    ///
+    /// Wave-batch payment only — the in-memory data path does not currently
+    /// support merkle batching. Use [`Client::file_prepare_upload_with_visibility`]
+    /// for merkle-eligible public uploads.
     ///
     /// After the caller signs and submits the payment transaction, call
     /// [`Client::finalize_upload`] with the tx hashes to complete storage.
     ///
     /// # Errors
     ///
-    /// Returns an error if encryption fails or quote collection fails.
-    pub async fn data_prepare_upload(&self, content: Bytes) -> Result<PreparedUpload> {
+    /// Returns an error if encryption fails, DataMap serialization fails
+    /// (public only), or quote collection fails.
+    pub async fn data_prepare_upload_with_visibility(
+        &self,
+        content: Bytes,
+        visibility: Visibility,
+    ) -> Result<PreparedUpload> {
         let content_len = content.len();
-        debug!("Preparing data upload for external signing ({content_len} bytes)");
+        debug!("Preparing data upload for external signing (visibility={visibility:?}, {content_len} bytes)");
 
         let (data_map, encrypted_chunks) = encrypt(content)
             .map_err(|e| Error::Encryption(format!("Failed to encrypt data: {e}")))?;
 
-        let chunk_count = encrypted_chunks.len();
-        info!("Data encrypted into {chunk_count} chunks");
-
-        let chunk_contents: Vec<Bytes> = encrypted_chunks
+        let mut chunk_contents: Vec<Bytes> = encrypted_chunks
             .into_iter()
             .map(|chunk| chunk.content)
             .collect();
+
+        info!("Data encrypted into {} chunks", chunk_contents.len());
+
+        // For public uploads, bundle the serialized DataMap as an extra chunk
+        // in the same payment batch. This lets the external signer pay for
+        // the data chunks and the DataMap chunk in one flow, and lets the
+        // finalize step return the DataMap's chunk address as the shareable
+        // retrieval address.
+        let data_map_address = match visibility {
+            Visibility::Private => None,
+            Visibility::Public => {
+                let serialized = rmp_serde::to_vec(&data_map).map_err(|e| {
+                    Error::Serialization(format!("Failed to serialize DataMap: {e}"))
+                })?;
+                let bytes = Bytes::from(serialized);
+                let address = compute_address(&bytes);
+                info!(
+                    "Public upload: bundling DataMap chunk ({} bytes) at address {}",
+                    bytes.len(),
+                    hex::encode(address)
+                );
+                chunk_contents.push(bytes);
+                Some(address)
+            }
+        };
+
+        let chunk_count = chunk_contents.len();
 
         let quote_limiter = self.controller().quote.clone();
         let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
@@ -218,7 +268,7 @@ impl Client {
                 prepared_chunks,
                 payment_intent,
             },
-            data_map_address: None,
+            data_map_address,
         })
     }
 
@@ -369,6 +419,12 @@ mod send_assertions {
     #[allow(dead_code, unreachable_code, clippy::diverging_sub_expression)]
     async fn _data_prepare_upload_is_send(client: &Client) {
         let fut = client.data_prepare_upload(Bytes::new());
+        _assert_send(&fut);
+    }
+
+    #[allow(dead_code, unreachable_code, clippy::diverging_sub_expression)]
+    async fn _data_prepare_upload_with_visibility_is_send(client: &Client) {
+        let fut = client.data_prepare_upload_with_visibility(Bytes::new(), Visibility::Public);
         _assert_send(&fut);
     }
 }
