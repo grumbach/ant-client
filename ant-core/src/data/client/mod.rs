@@ -81,6 +81,9 @@ const DEFAULT_QUOTE_TIMEOUT_SECS: u64 = 10;
 /// transfer, before accounting for QUIC slow-start and NAT traversal overhead.
 const DEFAULT_STORE_TIMEOUT_SECS: u64 = 10;
 
+/// Default timeout for chunk GET response operations in seconds.
+const DEFAULT_CHUNK_GET_TIMEOUT_SECS: u64 = 10;
+
 /// Default quote concurrency: high because quoting is pure network I/O
 /// (DHT lookups + small request/response messages) with no CPU-bound work.
 const DEFAULT_QUOTE_CONCURRENCY: usize = 32;
@@ -103,6 +106,10 @@ pub struct ClientConfig {
     /// transfer multi-MB payloads. The adaptive controller does NOT
     /// currently size timeouts; this remains a static knob.
     pub store_timeout_secs: u64,
+    /// Per-peer response timeout for chunk GET operations, in seconds.
+    /// This is intentionally independent from `store_timeout_secs`: PUTs
+    /// and GETs have different payload direction and performance profiles.
+    pub chunk_get_timeout_secs: u64,
     /// Number of closest peers to consider for routing.
     pub close_group_size: usize,
     /// **Deprecated.** Pre-adaptive ceiling for quote concurrency.
@@ -150,6 +157,7 @@ impl Default for ClientConfig {
         Self {
             quote_timeout_secs: DEFAULT_QUOTE_TIMEOUT_SECS,
             store_timeout_secs: DEFAULT_STORE_TIMEOUT_SECS,
+            chunk_get_timeout_secs: DEFAULT_CHUNK_GET_TIMEOUT_SECS,
             close_group_size: CLOSE_GROUP_SIZE,
             quote_concurrency: DEFAULT_QUOTE_CONCURRENCY,
             store_concurrency: DEFAULT_STORE_CONCURRENCY,
