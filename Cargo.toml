@@ -13,7 +13,18 @@ resolver = "2"
 # `ChunkPutRequest::content` on `main` but no crates.io release yet exists
 # that includes it. Without this patch, the transitive `ant-node 0.11.2`
 # fails to build under `cargo clippy --all-targets` / `cargo test`.
+#
+# Temporary patch: route saorsa-core through the fork branch carrying PR #114
+# (saorsa-labs/saorsa-core#114), which adds the `P2PNode::report_application_failure`
+# method this PR depends on. Both `[patch.crates-io]` (for ant-protocol's
+# saorsa-core dep, which crates.io publishes) and the git-URL patch below (for
+# ant-core's direct git dep) are needed so all transitive resolutions land
+# on the same source. Once #114 merges into saorsa-labs/saorsa-core
+# rc-2026.4.4, REMOVE the saorsa-core entries before merging the present PR.
 [patch.crates-io]
 ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol.git", rev = "93e63b8a41a97c37c24d1164a3ee5525e002ddcd" }
 ant-node = { git = "https://github.com/WithAutonomi/ant-node.git", rev = "8b68b2d7f4662faf67ed7812dc6cb37de0c74a8b" }
+saorsa-core = { git = "https://github.com/grumbach/saorsa-core", branch = "plan1/bad-node-eviction" }
 
+[patch."https://github.com/saorsa-labs/saorsa-core"]
+saorsa-core = { git = "https://github.com/grumbach/saorsa-core", branch = "plan1/bad-node-eviction" }

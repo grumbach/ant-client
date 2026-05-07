@@ -5214,7 +5214,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.24.2"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=fix%2Fstability-improvements#5586795740eafd9818e827baa2eb2677ff3ba942"
+source = "git+https://github.com/grumbach/saorsa-core?branch=plan1%2Fbad-node-eviction#97161f8e53411431c3fd1ccb117ebfed2e0de65a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5328,7 +5328,8 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.34.1"
-source = "git+https://github.com/saorsa-labs/saorsa-transport?branch=fix%2Fstability-improvements#55f423ca5e3312e31ba22475b68a76f4ffd50285"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31ebc09fb51e2c325e61ff09892f1256c60ef4f3beb881fd2980befe3e53e9bc"
 dependencies = [
  "anyhow",
  "async-trait",
