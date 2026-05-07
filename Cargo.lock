@@ -870,7 +870,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmp-serde",
- "saorsa-core 0.24.2 (git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.4.4)",
+ "saorsa-core",
  "self-replace",
  "self_encryption",
  "semver 1.0.28",
@@ -933,7 +933,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.13.3",
  "rmp-serde",
- "saorsa-core 0.24.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "saorsa-core",
  "saorsa-pqc 0.5.1",
  "self-replace",
  "self_encryption",
@@ -966,7 +966,7 @@ dependencies = [
  "hex",
  "postcard",
  "rmp-serde",
- "saorsa-core 0.24.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "saorsa-core",
  "saorsa-pqc 0.5.1",
  "serde",
  "tokio",
@@ -5198,39 +5198,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.24.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03e194874b524ad2a50d0976eb4ebcb81aea326dfb475373de9a2942a90cb2cc"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "bytes",
- "dashmap",
- "dirs 6.0.0",
- "futures",
- "hex",
- "lru",
- "once_cell",
- "parking_lot",
- "postcard",
- "rand 0.8.6",
- "saorsa-pqc 0.5.1",
- "saorsa-transport",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "wyz",
-]
-
-[[package]]
-name = "saorsa-core"
-version = "0.24.2"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.4.4#9ed219c687c7747a7842464d48d51d4ee5c0f0f1"
+source = "git+https://github.com/grumbach/saorsa-core?branch=plan1%2Fbad-node-eviction#97161f8e53411431c3fd1ccb117ebfed2e0de65a"
 dependencies = [
  "anyhow",
  "async-trait",

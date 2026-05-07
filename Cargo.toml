@@ -1,3 +1,16 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
+
+# Temporary patch: route saorsa-core through the fork branch carrying PR #114
+# (saorsa-labs/saorsa-core#114), which adds the `P2PNode::report_application_failure`
+# method this PR depends on. Both `[patch.crates-io]` (for ant-protocol's
+# saorsa-core dep, which crates.io publishes) and the git-URL patch (for
+# ant-core's direct git dep) are needed so all transitive resolutions land
+# on the same source. Once #114 merges into saorsa-labs/saorsa-core
+# rc-2026.4.4, REMOVE both blocks before merging the present PR.
+[patch.crates-io]
+saorsa-core = { git = "https://github.com/grumbach/saorsa-core", branch = "plan1/bad-node-eviction" }
+
+[patch."https://github.com/saorsa-labs/saorsa-core"]
+saorsa-core = { git = "https://github.com/grumbach/saorsa-core", branch = "plan1/bad-node-eviction" }
