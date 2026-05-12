@@ -170,10 +170,11 @@ impl Client {
         let timeout_secs = timeout.as_secs();
 
         let request_id = self.next_request_id();
-        // `content` is a refcounted `Bytes` shared with the sibling
-        // close-group sends; pass it through directly so each peer shares
-        // the same backing buffer instead of deep-copying the 4 MB payload.
-        let request = ChunkPutRequest::with_payment(address, content, proof);
+        // NOTE: temporarily forced back to .to_vec() because this merkle-test
+        // branch pins ant-protocol locally for saorsa-core lineup, and our
+        // local ant-protocol still has `content: Vec<u8>` rather than the
+        // `Bytes` variant from jacderida/ant-protocol@perf/chunk-put-bytes.
+        let request = ChunkPutRequest::with_payment(address, content.to_vec(), proof);
         let message = ChunkMessage {
             request_id,
             body: ChunkMessageBody::PutRequest(request),
