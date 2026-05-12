@@ -68,6 +68,13 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: nightly
+        # foundryup curls api.github.com to resolve the nightly tag.
+        # Anonymous calls are rate-limited at 60/hour shared per IP; macOS
+        # runners hit this regularly and fail with `curl: (56) ... 403`.
+        # Authenticating with the workflow's GITHUB_TOKEN raises the cap
+        # to 1000/hour per token.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Run E2E tests (serial)
         run: cargo test -p ant-core --test e2e_chunk --test e2e_data --test e2e_file --test e2e_payment --test e2e_security --test e2e_cost_estimate -- --test-threads=1
 
@@ -93,6 +100,10 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: nightly
+        # Auth the foundryup GitHub-API tag-lookup so macOS runners don't
+        # hit the anonymous 60/hour rate limit and 403 (see e2e step above).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Run merkle E2E tests (35-node testnet)
         run: cargo test -p ant-core --test e2e_merkle -- --test-threads=1
         env:
