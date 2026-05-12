@@ -81,15 +81,26 @@ const DEFAULT_QUOTE_TIMEOUT_SECS: u64 = 10;
 /// transfer, before accounting for QUIC slow-start and NAT traversal overhead.
 ///
 /// For merkle batch PUTs there is an additional storer-side cost: the
-/// payment verifier runs an iterative DHT lookup (`CLOSENESS_LOOKUP_TIMEOUT`
-/// in `ant-node`, 240 s post-PR #89) before accepting the proof. With the
-/// old 10 s budget the client gave up long before the storer could finish
-/// verifying, which is exactly the failure mode the anselme-testnet
-/// 2026-05-12 run surfaced as "every cross-region merkle chunk times out
-/// at 10 s". Bumped to 60 s as a compromise: covers most storer lookups
-/// without making the client hang on truly-dead peers. Storer-side worst
-/// case is still 240 s; honest peers complete in 5-30 s on a warm DHT.
-const DEFAULT_STORE_TIMEOUT_SECS: u64 = 60;
+/// payment verifier runs an iterative DHT lookup
+/// (`CLOSENESS_LOOKUP_TIMEOUT` in `ant-node`, **240 s** post-PR #89)
+/// before accepting the proof.
+///
+/// This timeout MUST be >= the storer-side `CLOSENESS_LOOKUP_TIMEOUT`
+/// plus padding for the store-response round-trip and storer-local
+/// I/O. Otherwise the client gives up while the storer is still
+/// happily verifying, the storer wastes CPU/bandwidth on a chunk the
+/// client has already discarded, and the client re-targets a
+/// different close-K member — potentially double-storing the same
+/// chunk and polluting routing.
+///
+/// 270 s = 240 s (storer lookup) + 30 s padding (network RTT + LMDB
+/// put + fsync + clock skew tolerance).
+///
+/// This invariant must be re-validated if either side's timeout
+/// changes. Anselme-testnet 2026-05-12 surfaced the original 10 s
+/// version of this bug as "every cross-region merkle chunk times out
+/// at 10 s" on a 210-node 7-region run.
+const DEFAULT_STORE_TIMEOUT_SECS: u64 = 270;
 
 /// Default timeout for chunk GET response operations in seconds.
 const DEFAULT_CHUNK_GET_TIMEOUT_SECS: u64 = 10;
