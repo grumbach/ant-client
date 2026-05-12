@@ -1260,36 +1260,121 @@ impl Client {
         }
 
         // Phase 2: Decide payment mode and upload in waves from disk.
+        //
+        // For the merkle path, attempt to resume from a cached
+        // receipt before paying again. The cache is keyed by the
+        // source file path; a successful upload deletes the cache so
+        // a subsequent re-upload of the same path will pay anew.
+        let file_path_key = path.display().to_string();
         let (chunks_stored, actual_mode, storage_cost_atto, gas_cost_wei) =
             if self.should_use_merkle(chunk_count, mode) {
                 info!("Using merkle batch payment for {chunk_count} file chunks");
 
-                let batch_result = match self
-                    .pay_for_merkle_batch(&spill.addresses, DATA_TYPE_CHUNK, spill.avg_chunk_size())
-                    .await
+                let batch_result = if let Some((_cache_path, cached)) =
+                    crate::data::client::cached_merkle::try_load_for_file(&file_path_key)
                 {
-                    Ok(result) => result,
-                    Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                        info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                        let (stored, sc, gc) =
-                            self.upload_waves_single(&spill, progress.as_ref()).await?;
-                        return Ok(FileUploadResult {
-                            data_map,
-                            chunks_stored: stored,
-                            chunks_failed: 0,
-                            total_chunks: chunk_count,
-                            payment_mode_used: PaymentMode::Single,
-                            storage_cost_atto: sc,
-                            gas_cost_wei: gc,
-                            data_map_address: None,
-                        });
+                    // Validate the cache matches this upload. If the
+                    // file was edited between attempts the cached
+                    // proofs would no longer be valid for the new
+                    // chunk addresses; in that case drop the cache
+                    // and pay fresh.
+                    let addresses_match = spill
+                        .addresses
+                        .iter()
+                        .all(|addr| cached.proofs.contains_key(addr));
+                    if addresses_match && cached.proofs.len() == chunk_count {
+                        info!(
+                            "Skipping merkle payment phase; resuming with \
+                             cached proofs ({} chunks)",
+                            cached.proofs.len()
+                        );
+                        cached
+                    } else {
+                        info!(
+                            "Cached merkle receipt does not match current file \
+                             content (cached={}, file={chunk_count}). \
+                             Discarding cache and paying fresh.",
+                            cached.proofs.len()
+                        );
+                        crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
+                        // Fall through to fresh payment below.
+                        match self
+                            .pay_for_merkle_batch(
+                                &spill.addresses,
+                                DATA_TYPE_CHUNK,
+                                spill.avg_chunk_size(),
+                            )
+                            .await
+                        {
+                            Ok(result) => {
+                                crate::data::client::cached_merkle::try_save(
+                                    &file_path_key,
+                                    &result,
+                                );
+                                result
+                            }
+                            Err(Error::InsufficientPeers(ref msg))
+                                if mode == PaymentMode::Auto =>
+                            {
+                                info!(
+                                    "Merkle needs more peers ({msg}), falling back to wave-batch"
+                                );
+                                let (stored, sc, gc) =
+                                    self.upload_waves_single(&spill, progress.as_ref()).await?;
+                                return Ok(FileUploadResult {
+                                    data_map,
+                                    chunks_stored: stored,
+                                    chunks_failed: 0,
+                                    total_chunks: chunk_count,
+                                    payment_mode_used: PaymentMode::Single,
+                                    storage_cost_atto: sc,
+                                    gas_cost_wei: gc,
+                                    data_map_address: None,
+                                });
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
-                    Err(e) => return Err(e),
+                } else {
+                    match self
+                        .pay_for_merkle_batch(
+                            &spill.addresses,
+                            DATA_TYPE_CHUNK,
+                            spill.avg_chunk_size(),
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            // Save BEFORE the store phase so a crash
+                            // mid-upload leaves a resumable receipt.
+                            crate::data::client::cached_merkle::try_save(&file_path_key, &result);
+                            result
+                        }
+                        Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
+                            info!("Merkle needs more peers ({msg}), falling back to wave-batch");
+                            let (stored, sc, gc) =
+                                self.upload_waves_single(&spill, progress.as_ref()).await?;
+                            return Ok(FileUploadResult {
+                                data_map,
+                                chunks_stored: stored,
+                                chunks_failed: 0,
+                                total_chunks: chunk_count,
+                                payment_mode_used: PaymentMode::Single,
+                                storage_cost_atto: sc,
+                                gas_cost_wei: gc,
+                                data_map_address: None,
+                            });
+                        }
+                        Err(e) => return Err(e),
+                    }
                 };
 
                 let (stored, sc, gc) = self
                     .upload_waves_merkle(&spill, &batch_result, progress.as_ref())
                     .await?;
+                // Upload succeeded end-to-end; the cached receipt is
+                // no longer needed.
+                crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
                 (stored, PaymentMode::Merkle, sc, gc)
             } else {
                 let (stored, sc, gc) = self.upload_waves_single(&spill, progress.as_ref()).await?;
