@@ -81,7 +81,6 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, DirEntry, File, OpenOptions};
-use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -155,16 +154,28 @@ fn payments_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Short non-cryptographic hash of the source file path string, used
-/// as the on-disk cache key.
+/// Stable digest of the canonical path string, used as the on-disk
+/// cache key.
 ///
-/// Same scheme as `cached_merkle::file_hash_key`. Collisions are
-/// content-validated against the current encrypted chunk addresses
-/// before being trusted.
+/// **Must be stable across binary versions** — the user can pay a
+/// wave on binary A, upgrade or downgrade between attempts, and
+/// expect resume to find the receipt on binary B. The standard-
+/// library `DefaultHasher` (`std::collections::hash_map::DefaultHasher`)
+/// is explicitly documented as NOT stable across rustc releases, so
+/// using it here would silently lose resumability on any toolchain
+/// upgrade. BLAKE3 gives a permanent, fixed-output digest. The first
+/// 16 bytes are plenty: with the lock-protected `find_existing` we
+/// content-validate cache hits against the current encrypted chunk
+/// addresses, so a 128-bit collision space is well beyond practical
+/// concern.
 fn file_hash_key(file_path: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    file_path.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let digest = blake3::hash(file_path.as_bytes());
+    let bytes = digest.as_bytes();
+    let mut out = String::with_capacity(32);
+    for byte in &bytes[..16] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn receipt_path(dir: &Path, ts: u64, key: &str) -> PathBuf {
@@ -173,9 +184,25 @@ fn receipt_path(dir: &Path, ts: u64, key: &str) -> PathBuf {
 
 /// Append a wave's worth of paid-chunk proofs to the on-disk receipt.
 ///
-/// If no receipt exists yet for this file, one is created with the
-/// current time as `first_pay_timestamp`. Otherwise the existing
-/// file is loaded, extended with the new proofs, and rewritten.
+/// If no receipt exists yet for this file, one is created. Otherwise
+/// the existing file is loaded, extended with the new proofs, and
+/// rewritten under a fresh `<now>_<key>` filename (with the old
+/// canonical unlinked atomically).
+///
+/// Why the filename rotates on every append
+/// ----------------------------------------
+/// The 24-hour TTL is enforced by parsing the timestamp prefix from
+/// the canonical filename (`cleanup_outdated` + `is_expired_filename`).
+/// If we kept the original filename across waves, a receipt holding a
+/// wave paid 23 h ago plus a wave paid 1 minute ago would be deleted
+/// wholesale at the 24-hour mark — stranding the fresh wave's
+/// payment. Rotating the filename to `<now>_<key>` on every successful
+/// append makes the on-disk TTL track "time since most recent paid
+/// wave" instead of "time since first wave", matching the semantic
+/// users expect: the cache survives as long as it keeps being used.
+/// Individual stale proofs inside the receipt are pruned by
+/// `prune_locally_expired_proofs` in `batch.rs`, which checks each
+/// `quote.timestamp` against the storer's per-quote budget.
 ///
 /// Atomicity & concurrency
 /// -----------------------
@@ -210,10 +237,11 @@ pub fn append_wave(
 
     // Find an existing receipt for this file (non-expired) and load
     // it, or create a fresh one stamped with now().
-    let (path, mut receipt) = match find_existing(&dir, &key)? {
-        Some((p, r)) => (p, r),
-        None => (receipt_path(&dir, now, &key), SingleNodeReceipt::new(now)),
+    let (old_path, mut receipt) = match find_existing(&dir, &key)? {
+        Some((p, r)) => (Some(p), r),
+        None => (None, SingleNodeReceipt::new(now)),
     };
+    let new_path = receipt_path(&dir, now, &key);
 
     receipt.proofs.extend(new_proofs);
     // Sum costs as U256 (Amount). A wave's storage cost is wei-scale
@@ -230,13 +258,25 @@ pub fn append_wave(
     }
     receipt.gas_cost_wei = receipt.gas_cost_wei.saturating_add(wave_gas_cost_wei);
 
-    write_receipt_atomic(&path, &receipt)?;
+    write_receipt_atomic(&new_path, &receipt)?;
+    // Unlink the old canonical (different filename), if any. Order:
+    // write-new then unlink-old means a crash between them leaves
+    // both files on disk briefly; `find_existing` returns the newer
+    // by directory iteration order and a subsequent
+    // `dedupe_canonical_receipts` cleans the older up. No proofs
+    // are ever lost in the gap because both files hold the same
+    // load-extend-write content; new_path is a strict superset.
+    if let Some(old) = old_path {
+        if old != new_path {
+            let _ = fs::remove_file(&old);
+        }
+    }
     debug!(
         "Appended {} proofs to single-node receipt for {file_path:?} ({})",
         receipt.proofs.len(),
-        path.display()
+        new_path.display()
     );
-    Ok(path)
+    Ok(new_path)
 }
 
 /// Remove specific chunk proofs from the cached receipt for a file,
@@ -528,17 +568,24 @@ fn recover_orphaned_tmps(dir: &Path, key: &str) {
     dedupe_canonical_receipts(dir, key);
 }
 
-/// Keep at most one canonical receipt per key — the one with the
-/// largest timestamp prefix.
+/// Keep at most one canonical receipt per key, **merging** the proof
+/// content of every readable sibling into the winning one before
+/// unlinking the rest.
 ///
 /// Multiple canonical receipts for the same key can arise if a
-/// previous `append_wave` raced an aborted recovery (eg. before the
-/// `.lock` was added). They can also arise transiently when
-/// `recover_orphaned_tmps` promotes a `<ts_new>_<key>.tmp` to
-/// canonical while a `<ts_old>_<key>` already exists from an earlier
-/// successful write. Without deduping, `find_existing` returns the
-/// first match from directory iteration — order is filesystem-
-/// dependent, so half the proofs end up silently unreachable.
+/// previous `append_wave` raced an aborted recovery, if a buggier
+/// older binary wrote without rotating, or if manual file recovery
+/// dropped a backup alongside the live file. Without merging, an
+/// older sibling can hold proofs the newer one never saw — eg. the
+/// older was written before a partial `delete_for_file` was
+/// interrupted, leaving the older as the only carrier of some
+/// waves' on-chain payments. Blind newest-wins would strand those.
+///
+/// Strategy: read every readable canonical sibling for the key, union
+/// their `proofs` maps and sum costs into the newest-timestamp
+/// canonical (overwriting it atomically), then unlink the rest.
+/// Unreadable siblings are unlinked without contributing — they
+/// can't strand a payment that's already corrupt-on-disk.
 fn dedupe_canonical_receipts(dir: &Path, key: &str) {
     let Ok(read_dir) = fs::read_dir(dir) else {
         return;
@@ -568,14 +615,81 @@ fn dedupe_canonical_receipts(dir: &Path, key: &str) {
         return;
     }
     canonicals.sort_by_key(|c| std::cmp::Reverse(c.0));
+
+    // Identify the winner (newest), then fold every other readable
+    // sibling into it.
+    let (winner_ts, winner_path) = canonicals[0].clone();
+    let mut winner = match read_receipt(&winner_path) {
+        Ok(r) => r,
+        Err(_) => {
+            // Newest is corrupt: unlink it and let the next-newest
+            // become the winner on the recursive retry.
+            warn!(
+                "Newest canonical {} unreadable; unlinking and retrying dedupe",
+                winner_path.display()
+            );
+            let _ = fs::remove_file(&winner_path);
+            return dedupe_canonical_receipts(dir, key);
+        }
+    };
+
+    let mut merged_from = 0usize;
     for (_, stale) in canonicals.iter().skip(1) {
-        warn!(
-            "Removing duplicate canonical receipt {} (older sibling of \
-             a newer recovered receipt)",
-            stale.display()
-        );
+        match read_receipt(stale) {
+            Ok(other) => {
+                // Union proofs: an entry only present in the older
+                // sibling represents a paid wave the newer never saw.
+                // Keep the WINNER's bytes when both have the same
+                // address (newer paid wave's proof — by load-extend-
+                // write semantics newer should hold the same proof
+                // unless a buggier binary wrote independently).
+                let mut added = 0usize;
+                for (addr, bytes) in other.proofs {
+                    winner.proofs.entry(addr).or_insert_with(|| {
+                        added += 1;
+                        bytes
+                    });
+                }
+                if let (Ok(w), Ok(o)) = (
+                    winner.storage_cost_atto.parse::<Amount>(),
+                    other.storage_cost_atto.parse::<Amount>(),
+                ) {
+                    winner.storage_cost_atto = w.saturating_add(o).to_string();
+                }
+                winner.gas_cost_wei = winner.gas_cost_wei.saturating_add(other.gas_cost_wei);
+                winner.first_pay_timestamp =
+                    winner.first_pay_timestamp.min(other.first_pay_timestamp);
+                merged_from += 1;
+                info!(
+                    "Merged {added} proofs from older canonical {} into winner {}",
+                    stale.display(),
+                    winner_path.display()
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "Dropping unreadable duplicate canonical {} (no recoverable proofs)",
+                    stale.display()
+                );
+            }
+        }
         let _ = fs::remove_file(stale);
     }
+
+    if merged_from > 0 {
+        // Rewrite the winner under its own filename with the merged
+        // content. Same path, write-tmp-and-rename keeps the on-disk
+        // state coherent across the rewrite.
+        if let Err(e) = write_receipt_atomic(&winner_path, &winner) {
+            warn!(
+                "Could not rewrite merged canonical receipt {} ({e}); \
+                 winner retains pre-merge content and the older proofs \
+                 are lost. Best-effort: leaving on-disk state as-is.",
+                winner_path.display()
+            );
+        }
+    }
+    let _ = winner_ts;
 }
 
 fn find_existing(dir: &Path, key: &str) -> Result<Option<(PathBuf, SingleNodeReceipt)>> {
@@ -805,6 +919,85 @@ mod tests {
     fn file_hash_key_is_stable() {
         assert_eq!(file_hash_key("/tmp/a"), file_hash_key("/tmp/a"));
         assert_ne!(file_hash_key("/tmp/a"), file_hash_key("/tmp/b"));
+    }
+
+    #[test]
+    fn file_hash_key_uses_stable_digest_across_invocations() {
+        // BLAKE3 is a fixed-output cryptographic hash, so the key for
+        // a given path string must be identical not just within a
+        // process run but across binary versions / rustc upgrades.
+        // Pin the expected hex digest so a future change away from
+        // BLAKE3 (or back to DefaultHasher) trips this test loudly.
+        // First 16 bytes of BLAKE3("/tmp/anselme-cache-stable-test"):
+        let expected = "491a1a569cd6c544074a70504b2b5183";
+        assert_eq!(file_hash_key("/tmp/anselme-cache-stable-test"), expected);
+    }
+
+    /// Reproduces codex finding #1: receipt filename used to embed
+    /// the FIRST wave's timestamp. A wave paid 23h after that first
+    /// wave would get dropped by filename-TTL at the 24h mark even
+    /// though it's only an hour old.
+    ///
+    /// Post-fix: `append_wave` rotates the canonical filename to
+    /// `<now>_<key>` on every successful append, so the filename
+    /// timestamp tracks the LAST paid wave. The receipt survives as
+    /// long as it keeps being used.
+    #[test]
+    fn append_wave_rotates_filename_so_late_waves_dont_age_out() -> Result<()> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let file_path = format!("/tmp/anselme-ttl-rotation-test-{nanos}");
+
+        let mut wave1: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        wave1.insert([1u8; 32], vec![1]);
+        let path_after_wave1 = append_wave(&file_path, wave1, "10", 20)?;
+        let ts_after_wave1 = path_after_wave1
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.split_once('_'))
+            .and_then(|(ts, _)| ts.parse::<u64>().ok())
+            .expect("wave1 receipt name parses");
+
+        // Sleep just long enough that `now` advances by at least 1
+        // second. Without this, both waves can land on the same
+        // timestamp and the rotation is a no-op for this test
+        // (still correct semantics, just not observable here).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let mut wave2: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        wave2.insert([2u8; 32], vec![2]);
+        let path_after_wave2 = append_wave(&file_path, wave2, "5", 10)?;
+        let ts_after_wave2 = path_after_wave2
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.split_once('_'))
+            .and_then(|(ts, _)| ts.parse::<u64>().ok())
+            .expect("wave2 receipt name parses");
+
+        assert_ne!(
+            path_after_wave1, path_after_wave2,
+            "filename must rotate so TTL tracks LAST wave, not first"
+        );
+        assert!(
+            ts_after_wave2 > ts_after_wave1,
+            "rotated filename's timestamp must be strictly newer"
+        );
+        assert!(
+            !path_after_wave1.exists(),
+            "old canonical must be unlinked after the rewrite"
+        );
+        assert!(path_after_wave2.exists());
+
+        // The merged receipt contains BOTH waves' proofs at the new
+        // path — the older entries are NOT lost in the rotation.
+        let (_, loaded) = load_for_file(&file_path)?.expect("receipt should load");
+        assert!(loaded.proofs.contains_key(&[1u8; 32]));
+        assert!(loaded.proofs.contains_key(&[2u8; 32]));
+
+        delete_for_file(&file_path)?;
+        Ok(())
     }
 
     #[test]
@@ -1440,12 +1633,14 @@ mod tests {
         Ok(())
     }
 
-    /// Duplicate canonical receipts (eg. residue from a buggier
-    /// earlier version, or a `<ts_new>_<key>.tmp` recovered over a
-    /// pre-existing `<ts_old>_<key>` canonical) must be deduped:
-    /// newest timestamp wins, older are unlinked.
+    /// Duplicate canonical receipts must be merged before the older
+    /// is unlinked — never blindly newest-wins. The older may hold
+    /// proofs the newer never saw (residue from a buggier binary,
+    /// manual file recovery, interrupted operation). Blind unlink
+    /// would strand any on-chain payment whose proof lives only in
+    /// the older sibling.
     #[test]
-    fn duplicate_canonical_receipts_are_deduplicated_keeping_newest() -> Result<()> {
+    fn duplicate_canonical_receipts_are_merged_then_older_unlinked() -> Result<()> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1467,23 +1662,42 @@ mod tests {
         let old_path = dir.join(format!("{old_ts}_{key}"));
         let new_path = dir.join(format!("{new_ts}_{key}"));
         let mut old = SingleNodeReceipt::new(old_ts);
-        old.proofs.insert([1u8; 32], vec![1]);
+        old.proofs.insert([1u8; 32], vec![0xAA]);
+        old.storage_cost_atto = "10".to_string();
+        old.gas_cost_wei = 20;
         let mut new = SingleNodeReceipt::new(new_ts);
-        new.proofs.insert([2u8; 32], vec![2]);
+        new.proofs.insert([2u8; 32], vec![0xBB]);
+        new.storage_cost_atto = "30".to_string();
+        new.gas_cost_wei = 40;
         write_receipt_atomic(&old_path, &old)?;
         write_receipt_atomic(&new_path, &new)?;
         assert!(old_path.exists() && new_path.exists());
 
-        // Trigger dedupe via a recovery-pass entry point.
         let _guard = ReceiptLock::acquire(&dir, &key)?;
         dedupe_canonical_receipts(&dir, &key);
         drop(_guard);
 
         assert!(
             !old_path.exists(),
-            "older canonical receipt must be unlinked"
+            "older canonical receipt must be unlinked after merge"
         );
         assert!(new_path.exists(), "newer canonical receipt must survive");
+
+        // The winner now holds BOTH proofs and the SUMMED costs —
+        // the older's proof was NOT stranded.
+        let merged = read_receipt(&new_path)?;
+        assert!(
+            merged.proofs.contains_key(&[1u8; 32]),
+            "older sibling's proof must be merged into the winner"
+        );
+        assert!(merged.proofs.contains_key(&[2u8; 32]));
+        assert_eq!(merged.proofs.len(), 2);
+        assert_eq!(merged.storage_cost_atto, "40", "costs must be summed");
+        assert_eq!(merged.gas_cost_wei, 60);
+        assert_eq!(
+            merged.first_pay_timestamp, old_ts,
+            "first_pay_timestamp must be the MIN across merged siblings"
+        );
 
         delete_for_file(&file_path)?;
         Ok(())
