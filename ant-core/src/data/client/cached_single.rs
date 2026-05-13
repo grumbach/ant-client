@@ -493,7 +493,7 @@ fn recover_orphaned_tmps(dir: &Path, key: &str) {
     }
 
     // Sort descending by timestamp so the newest readable .tmp wins.
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
 
     let mut recovered = false;
     for (_, path, readable) in candidates {
@@ -567,7 +567,7 @@ fn dedupe_canonical_receipts(dir: &Path, key: &str) {
     if canonicals.len() <= 1 {
         return;
     }
-    canonicals.sort_by(|a, b| b.0.cmp(&a.0));
+    canonicals.sort_by_key(|c| std::cmp::Reverse(c.0));
     for (_, stale) in canonicals.iter().skip(1) {
         warn!(
             "Removing duplicate canonical receipt {} (older sibling of \
