@@ -352,7 +352,7 @@ impl Client {
         chunks: Vec<Bytes>,
     ) -> Result<(Vec<XorName>, String, u128)> {
         let (addresses, storage, gas, _stats) = self
-            .batch_upload_chunks_with_events(chunks, None, 0, 0)
+            .batch_upload_chunks_with_events(chunks, None, 0, 0, None)
             .await?;
         Ok((addresses, storage, gas))
     }
@@ -363,12 +363,20 @@ impl Client {
     /// `stored_offset` is the number of chunks already stored in previous waves
     /// (so events report cumulative progress). `file_total` is the total chunk
     /// count across ALL waves (for the `total` field in events).
+    ///
+    /// When `resume_key` is `Some`, per-wave payment proofs are persisted
+    /// to `<data_dir>/payments/single/<ts>_<hash(resume_key)>` via
+    /// `crate::data::client::cached_single` so that a partial-upload
+    /// failure can be resumed on the next attempt without paying twice.
+    /// The caller is responsible for deleting the cache entry on full
+    /// success (typically `upload_with_options` in `file.rs`).
     pub async fn batch_upload_chunks_with_events(
         &self,
         chunks: Vec<Bytes>,
         progress: Option<&mpsc::Sender<UploadEvent>>,
         stored_offset: usize,
         file_total: usize,
+        resume_key: Option<&str>,
     ) -> Result<(Vec<XorName>, String, u128, WaveAggregateStats)> {
         if chunks.is_empty() {
             return Ok((
@@ -386,6 +394,20 @@ impl Client {
             "Batch uploading {total_chunks} chunks in waves of {PAYMENT_WAVE_SIZE} \
              (current adaptive caps — quote: {quote_cap}, store: {store_cap})"
         );
+
+        // Load any previously-cached single-node receipt for this
+        // upload. Each chunk whose address is in the cache will skip
+        // the quote + pay phases and have its `PaidChunk` constructed
+        // directly from the cached proof + fresh quoted peers. The
+        // caller is responsible for deleting the cache on full
+        // success; we only read here, never write the load result back.
+        let cached_proofs: HashMap<XorName, Vec<u8>> = match resume_key {
+            Some(key) => match crate::data::client::cached_single::try_load_for_file(key) {
+                Some((_, receipt)) => receipt.proofs,
+                None => HashMap::new(),
+            },
+            None => HashMap::new(),
+        };
 
         let mut all_addresses = Vec::with_capacity(total_chunks);
         let mut seen_addresses: HashSet<XorName> = HashSet::new();
@@ -492,15 +514,63 @@ impl Client {
                 continue;
             }
 
-            info!(
-                "Wave {wave_num}/{wave_count}: paying for {} chunks",
-                prepared_chunks.len()
-            );
-            let (paid_chunks, wave_storage, wave_gas) = self.batch_pay(prepared_chunks).await?;
+            // Split prepared chunks into "already paid in a previous
+            // attempt" (cached) and "needs payment" (fresh). Cached
+            // chunks build a `PaidChunk` from the cached proof + the
+            // freshly-quoted peers, bypassing the EVM transaction.
+            let mut needs_pay: Vec<PreparedChunk> = Vec::with_capacity(prepared_chunks.len());
+            let mut cached_paid: Vec<PaidChunk> = Vec::new();
+            for prep in prepared_chunks {
+                if let Some(proof_bytes) = cached_proofs.get(&prep.address).cloned() {
+                    cached_paid.push(PaidChunk {
+                        content: prep.content,
+                        address: prep.address,
+                        quoted_peers: prep.quoted_peers,
+                        proof_bytes,
+                    });
+                } else {
+                    needs_pay.push(prep);
+                }
+            }
+            if !cached_paid.is_empty() {
+                info!(
+                    "Wave {wave_num}/{wave_count}: reusing {} cached payment proofs",
+                    cached_paid.len()
+                );
+            }
+
+            let (mut paid_chunks, wave_storage, wave_gas) = if needs_pay.is_empty() {
+                (Vec::new(), "0".to_string(), 0u128)
+            } else {
+                info!(
+                    "Wave {wave_num}/{wave_count}: paying for {} chunks",
+                    needs_pay.len()
+                );
+                self.batch_pay(needs_pay).await?
+            };
             if let Ok(cost) = wave_storage.parse::<Amount>() {
                 total_storage += cost;
             }
             total_gas = total_gas.saturating_add(wave_gas);
+
+            // Persist the freshly-paid wave's proofs so a later
+            // failure can resume without re-paying.
+            if let Some(key) = resume_key {
+                if !paid_chunks.is_empty() {
+                    let new_proofs: HashMap<[u8; 32], Vec<u8>> = paid_chunks
+                        .iter()
+                        .map(|pc| (pc.address, pc.proof_bytes.clone()))
+                        .collect();
+                    crate::data::client::cached_single::try_append_wave(
+                        key,
+                        new_proofs,
+                        &wave_storage,
+                        wave_gas,
+                    );
+                }
+            }
+
+            paid_chunks.extend(cached_paid);
             pending_store = Some(paid_chunks);
         }
 
