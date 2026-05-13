@@ -109,7 +109,9 @@ pub fn save(file_path: &str, result: &MerkleBatchPaymentResult) -> Result<PathBu
     };
     let path = dir.join(format!("{ts}_{}", file_hash_key(file_path)));
     let handle = File::create(&path)?;
-    serde_json::to_writer(BufWriter::new(handle), result)
+    // msgpack (rmp-serde) rather than JSON because `proofs` is keyed by
+    // `[u8; 32]` which JSON cannot represent as a map key.
+    rmp_serde::encode::write(&mut BufWriter::new(handle), result)
         .map_err(|e| crate::error::Error::Io(std::io::Error::other(e.to_string())))?;
     debug!(
         "Cached merkle payment receipt for {file_path:?} to {}",
@@ -281,7 +283,7 @@ fn is_expired_filename(name: &str) -> bool {
 
 fn read_receipt(path: &Path) -> Result<MerkleBatchPaymentResult> {
     let handle = File::open(path)?;
-    let receipt: MerkleBatchPaymentResult = serde_json::from_reader(BufReader::new(handle))
+    let receipt: MerkleBatchPaymentResult = rmp_serde::decode::from_read(BufReader::new(handle))
         .map_err(|e| crate::error::Error::Io(std::io::Error::other(e.to_string())))?;
     Ok(receipt)
 }
