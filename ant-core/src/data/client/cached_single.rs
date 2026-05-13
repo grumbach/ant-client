@@ -359,17 +359,6 @@ fn write_receipt(path: &Path, receipt: &SingleNodeReceipt) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn dummy_receipt(ts: u64) -> SingleNodeReceipt {
-        let mut proofs: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
-        proofs.insert([1u8; 32], vec![1, 2, 3]);
-        SingleNodeReceipt {
-            proofs,
-            first_pay_timestamp: ts,
-            storage_cost_atto: "100".to_string(),
-            gas_cost_wei: 200,
-        }
-    }
-
     #[test]
     fn file_hash_key_is_stable() {
         assert_eq!(file_hash_key("/tmp/a"), file_hash_key("/tmp/a"));
@@ -401,10 +390,11 @@ mod tests {
 
     #[test]
     fn roundtrip_save_load_delete() -> Result<()> {
-        let file_path = format!(
-            "/tmp/anselme-resumable-single-test-{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-        );
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let file_path = format!("/tmp/anselme-resumable-single-test-{nanos}");
         let mut wave1: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
         wave1.insert([2u8; 32], vec![10, 20]);
         let path1 = append_wave(&file_path, wave1, "50", 100)?;
@@ -413,8 +403,7 @@ mod tests {
         let mut wave2: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
         wave2.insert([3u8; 32], vec![30, 40]);
         let path2 = append_wave(&file_path, wave2, "70", 50)?;
-        // Same file path: should be the same on-disk path (we don't
-        // create a new timestamped file per wave).
+        // Same file path: one on-disk receipt per upload, appended across waves.
         assert_eq!(path1, path2);
 
         let (loaded_path, loaded) = load_for_file(&file_path)?.expect("receipt should load");
@@ -430,5 +419,4 @@ mod tests {
         assert!(load_for_file(&file_path)?.is_none());
         Ok(())
     }
-
 }
