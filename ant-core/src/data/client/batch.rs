@@ -14,7 +14,9 @@ use ant_protocol::evm::{
     Amount, EncodedPeerId, PayForQuotesError, PaymentQuote, ProofOfPayment, QuoteHash,
     RewardsAddress, TxHash,
 };
-use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
+use ant_protocol::payment::{
+    deserialize_proof, serialize_single_node_proof, PaymentProof, SingleNodePayment,
+};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{compute_address, XorName, DATA_TYPE_CHUNK};
 use bytes::Bytes;
@@ -401,20 +403,45 @@ impl Client {
         // directly from the cached proof + fresh quoted peers. The
         // caller is responsible for deleting the cache on full
         // success; we only read here, never write the load result back.
-        let cached_proofs: HashMap<XorName, Vec<u8>> = match resume_key {
-            Some(key) => match crate::data::client::cached_single::try_load_for_file(key) {
-                Some((_, receipt)) => receipt.proofs,
-                None => HashMap::new(),
-            },
-            None => HashMap::new(),
-        };
+        //
+        // Before trusting any cached proof, decode it locally and drop
+        // any whose quote.timestamp is past the storer's per-quote age
+        // budget (`QUOTE_MAX_AGE_SECS`, mirrored here as
+        // `CACHED_PROOF_EXPIRY_SECS`). The previous design trusted a
+        // substring match on remote error text, which a Byzantine
+        // storer could spoof to force double-payment. Local pre-flight
+        // is decision-pure: we never hand a doomed proof to a storer,
+        // and the cache is updated under our own lock with no remote
+        // text involved.
+        // `cached_cost` carries the cumulative cost from waves paid in
+        // a previous run so the returned tally reflects total spend on
+        // this file, not just freshly-paid chunks. Without this the
+        // user's "this upload cost X" message under-reports by the
+        // resumed waves' cost.
+        let (cached_proofs, cached_storage, cached_gas): (HashMap<XorName, Vec<u8>>, Amount, u128) =
+            match resume_key {
+                Some(key) => match crate::data::client::cached_single::try_load_for_file(key) {
+                    Some((_, receipt)) => {
+                        let prior_storage = receipt
+                            .storage_cost_atto
+                            .parse::<Amount>()
+                            .unwrap_or(Amount::ZERO);
+                        let prior_gas = receipt.gas_cost_wei;
+                        let kept = prune_locally_expired_proofs(key, receipt.proofs);
+                        (kept, prior_storage, prior_gas)
+                    }
+                    None => (HashMap::new(), Amount::ZERO, 0u128),
+                },
+                None => (HashMap::new(), Amount::ZERO, 0u128),
+            };
 
         let mut all_addresses = Vec::with_capacity(total_chunks);
         let mut seen_addresses: HashSet<XorName> = HashSet::new();
 
-        // Accumulate costs across waves.
-        let mut total_storage = Amount::ZERO;
-        let mut total_gas: u128 = 0;
+        // Accumulate costs across waves, seeded with cumulative from
+        // any cached receipt loaded above.
+        let mut total_storage = cached_storage;
+        let mut total_gas: u128 = cached_gas;
         let mut agg_stats = WaveAggregateStats::default();
 
         // Deduplicate chunks by content address.
@@ -849,6 +876,121 @@ fn log_wave_summary(result: &WaveResult) {
     );
 }
 
+/// Safety margin subtracted from the storer's `QUOTE_MAX_AGE_SECS` (24 h)
+/// when deciding to trust a cached proof.
+///
+/// A proof whose oldest `quote.timestamp` is closer than this to the
+/// storer's hard limit is treated as already-expired locally. The
+/// margin covers (a) clock skew between client and storer, (b) the
+/// in-flight time between the local check and the storer's
+/// `validate_quote_timestamps` call, and (c) the time spent uploading
+/// the chunk body. 5 minutes is generous for all three combined and
+/// cheap: a wrongly-kept proof costs an extra retry round trip, a
+/// wrongly-dropped proof costs one re-pay (cheap chunk).
+const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
+
+/// Storer-side budget for a quote's age. Mirrors `QUOTE_MAX_AGE_SECS`
+/// in `ant-node/src/payment/verifier.rs`. If this value drifts on the
+/// node side, the worst case is the client either keeps proofs slightly
+/// past the storer limit (forced re-pay on next retry, no money lost)
+/// or drops them slightly early (one extra re-pay, no money lost).
+/// Either way, no payment is double-spent or stranded.
+const CACHED_PROOF_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Drop cached `proof_bytes` whose quote timestamps are too close to
+/// the storer's expiry window to safely reuse.
+///
+/// Why this exists
+/// ---------------
+/// The cache stores `(chunk_address, proof_bytes)` so a retried upload
+/// can skip re-paying. The proof bytes embed `quote.timestamp`s. Each
+/// storer evaluates each `quote.timestamp` independently against its
+/// 24 h `QUOTE_MAX_AGE_SECS` budget, so close to the 24 h boundary
+/// (or on a multi-day-old cache that survived past the receipt's outer
+/// expiry for some reason) the storer rejects what the client still
+/// believes is fresh.
+///
+/// The previous design trusted a substring match on the storer's
+/// returned error text to detect this and invalidate the cache after
+/// the fact. That allowed a Byzantine storer to spoof the marker and
+/// force the client to re-pay fresh proofs (double-payment). This
+/// implementation is decision-pure: we decode the proof locally and
+/// only re-use it if every embedded quote is comfortably within the
+/// budget. No remote text involved.
+///
+/// Side-effect: dropped entries are removed from the on-disk cache so
+/// they don't reappear on the next load.
+fn prune_locally_expired_proofs(
+    resume_key: &str,
+    proofs: HashMap<[u8; 32], Vec<u8>>,
+) -> HashMap<XorName, Vec<u8>> {
+    let now = std::time::SystemTime::now();
+    let max_safe_age = Duration::from_secs(
+        CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
+    );
+    let mut kept: HashMap<XorName, Vec<u8>> = HashMap::with_capacity(proofs.len());
+    // Pair each expired address with the EXACT bytes we observed at
+    // load time. The cache-side drop only removes the entry if those
+    // bytes still match, so a concurrent re-pay that refreshed the
+    // proof under its own lock is not clobbered (CAS semantics, fixes
+    // the TOCTOU between unlocked-load and locked-drop).
+    let mut expired: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    for (addr, bytes) in proofs {
+        match deserialize_proof(&bytes) {
+            Ok((proof, _tx_hashes)) => {
+                if proof_is_safely_fresh(&proof, now, max_safe_age) {
+                    kept.insert(addr, bytes);
+                } else {
+                    expired.push((addr, bytes));
+                }
+            }
+            Err(_) => {
+                // Unreadable cached entry: drop it so it doesn't sit
+                // here forever. The chunk will re-quote+re-pay.
+                expired.push((addr, bytes));
+            }
+        }
+    }
+    if !expired.is_empty() {
+        info!(
+            "Pruning {} stale cached proofs (quote.timestamp past safe-reuse window) \
+             before resume",
+            expired.len()
+        );
+        crate::data::client::cached_single::try_drop_proofs_for_file(resume_key, &expired);
+    }
+    kept
+}
+
+/// True iff every quote in the proof has a timestamp not older than
+/// `now - max_safe_age` AND not implausibly in the future. A future
+/// timestamp is a clock-skew signal: if the storer's clock matches
+/// `now` and the quote claims a future time, the storer will reject
+/// it with the future-skew branch of `validate_quote_timestamps`. We
+/// drop those too rather than send them and lose the round trip.
+fn proof_is_safely_fresh(
+    proof: &ProofOfPayment,
+    now: std::time::SystemTime,
+    max_safe_age: Duration,
+) -> bool {
+    for (_peer, quote) in &proof.peer_quotes {
+        match now.duration_since(quote.timestamp) {
+            Ok(age) => {
+                if age > max_safe_age {
+                    return false;
+                }
+            }
+            Err(_) => {
+                // Future-dated quote relative to local clock. Treat as
+                // unsafe to reuse — the storer's clock-skew tolerance
+                // is unknown to us here, so any forward drift is risky.
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Compile-time assertions that batch method futures are Send.
 #[cfg(test)]
 mod send_assertions {
@@ -981,5 +1123,100 @@ mod tests {
 
         let paid = finalize_batch_payment(vec![c1, c2], &tx_map).unwrap();
         assert_eq!(paid.len(), 2);
+    }
+
+    // ---- prune_locally_expired_proofs ----
+    //
+    // Build synthetic ProofOfPayment instances with controlled
+    // timestamps to verify the local pre-flight stale-proof check.
+    // This is the "no remote text trust" replacement for the prior
+    // substring-matching invalidation path. A bug here is a direct
+    // wallet leak (drop-too-eager = re-pay; keep-too-long = doomed
+    // PUT round trip but no payment loss).
+
+    fn make_proof_with_timestamps(timestamps: &[std::time::SystemTime]) -> ProofOfPayment {
+        let peer_quotes = timestamps
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| {
+                let quote = PaymentQuote {
+                    content: xor_name::XorName([0u8; 32]),
+                    timestamp: *ts,
+                    price: Amount::from(1u64),
+                    rewards_address: RewardsAddress::new([1u8; 20]),
+                    pub_key: vec![],
+                    signature: vec![],
+                };
+                (EncodedPeerId::from([i as u8; 32]), quote)
+            })
+            .collect();
+        ProofOfPayment { peer_quotes }
+    }
+
+    #[test]
+    fn proof_is_safely_fresh_accepts_recent_quote() {
+        let proof = make_proof_with_timestamps(&[std::time::SystemTime::now()]);
+        assert!(proof_is_safely_fresh(
+            &proof,
+            std::time::SystemTime::now(),
+            Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS),
+        ));
+    }
+
+    #[test]
+    fn proof_is_safely_fresh_rejects_quote_past_safe_window() {
+        // 23h57m old: past the 24h - 5min safe-reuse threshold but
+        // still within the storer's hard 24h limit. The whole point
+        // of the safety margin is to drop these locally before
+        // burning a doomed PUT round trip.
+        let too_old = std::time::SystemTime::now() - Duration::from_secs(23 * 60 * 60 + 57 * 60);
+        let proof = make_proof_with_timestamps(&[too_old]);
+        let max_safe = Duration::from_secs(
+            CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
+        );
+        assert!(
+            !proof_is_safely_fresh(&proof, std::time::SystemTime::now(), max_safe),
+            "23h57m-old quote must fail safe-reuse check (limit is 24h - 5min margin)"
+        );
+    }
+
+    #[test]
+    fn proof_is_safely_fresh_rejects_if_any_quote_is_stale() {
+        // The storer rejects on a per-quote basis: a proof with even
+        // one stale quote will fail on every retry. We must drop it.
+        let now = std::time::SystemTime::now();
+        let fresh = now;
+        let stale = now - Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS);
+        let proof = make_proof_with_timestamps(&[fresh, fresh, stale, fresh]);
+        let max_safe = Duration::from_secs(
+            CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
+        );
+        assert!(!proof_is_safely_fresh(&proof, now, max_safe));
+    }
+
+    #[test]
+    fn proof_is_safely_fresh_rejects_future_dated_quote() {
+        // Forward clock skew: the storer's future-skew tolerance is
+        // unknown here, so any forward-drifted quote is unsafe to
+        // re-use. We bail rather than burn a round trip.
+        let now = std::time::SystemTime::now();
+        let future = now + Duration::from_secs(3600);
+        let proof = make_proof_with_timestamps(&[future]);
+        let max_safe = Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS);
+        assert!(!proof_is_safely_fresh(&proof, now, max_safe));
+    }
+
+    #[test]
+    fn proof_is_safely_fresh_empty_quotes_is_vacuously_safe() {
+        // No quotes = no storer-side timestamp check to fail. The
+        // proof is structurally invalid for other reasons, but
+        // this function's contract is "no stale timestamp present",
+        // which is trivially true for an empty list.
+        let proof = make_proof_with_timestamps(&[]);
+        assert!(proof_is_safely_fresh(
+            &proof,
+            std::time::SystemTime::now(),
+            Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS),
+        ));
     }
 }

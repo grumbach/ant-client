@@ -1285,9 +1285,17 @@ impl Client {
         //
         // For the merkle path, attempt to resume from a cached
         // receipt before paying again. The cache is keyed by the
-        // source file path; a successful upload deletes the cache so
-        // a subsequent re-upload of the same path will pay anew.
-        let file_path_key = path.display().to_string();
+        // CANONICAL source path so `./foo`, `/abs/foo`, and any
+        // symlink alias all resolve to the same cache entry — a
+        // crash-and-retry from a different cwd or via a different
+        // alias still hits the receipt. Canonicalize may fail (the
+        // file could have been moved between phase 1 and here); we
+        // fall back to the display string in that case, which
+        // preserves pre-fix behaviour rather than dropping cache
+        // resume entirely.
+        let file_path_key = std::fs::canonicalize(path)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
         let (chunks_stored, actual_mode, storage_cost_atto, gas_cost_wei, stats) = if self
             .should_use_merkle(chunk_count, mode)
         {
