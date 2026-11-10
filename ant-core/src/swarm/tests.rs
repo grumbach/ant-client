@@ -543,6 +543,18 @@ fn a_client_asks_for_a_files_records_in_one_order_of_its_own() {
 }
 
 #[test]
+fn a_records_place_is_where_the_clients_order_asks_for_it() {
+    let swarm = Swarm::with_rtc(None, 0);
+    let order = swarm.read_order(64);
+    let places = swarm.read_places(64);
+    assert_eq!(places.len(), 64);
+    for (place, record) in order.iter().enumerate() {
+        assert_eq!(places.get(*record), Some(&place));
+    }
+    assert!(swarm.read_places(0).is_empty());
+}
+
+#[test]
 fn a_room_starts_a_bounded_number_of_answers() {
     let room = Room::new([3; 32], 1, SECRET).unwrap_or_else(|| panic!("a room"));
     for _ in 0..room::ANSWERS_PER_WINDOW {

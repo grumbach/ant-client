@@ -674,8 +674,8 @@ pub(crate) struct Inner {
     /// Whether any join waits, so a read looks at them only then.
     joins_wait: AtomicBool,
     stop: Arc<Stop>,
-    /// Picks the order this client's browser downloads ask for a file's
-    /// records in (see [`Swarm::read_order`]).
+    /// Picks the order this client's downloads ask for a file's records in
+    /// (see [`Swarm::read_order`]).
     read_order_seed: u64,
 }
 
@@ -744,19 +744,38 @@ impl Swarm {
         }
     }
 
-    /// The order a browser download asks for a file's `records` records in:
-    /// picked at random once per client, as BitTorrent picks pieces, so
-    /// readers in different clients ask in different orders, while two
-    /// downloads of one file in this client ask in the same one and keep
-    /// sharing each record's fetch.
+    /// The order a download asks for a file's `records` records in: picked
+    /// at random once per client, as BitTorrent picks pieces, so readers in
+    /// different clients ask in different orders, while two downloads of one
+    /// file in this client ask in the same one and keep sharing each record's
+    /// fetch.
     #[cfg_attr(
-        not(all(feature = "browser-wasm", target_arch = "wasm32")),
+        not(any(
+            feature = "native",
+            all(feature = "browser-wasm", target_arch = "wasm32")
+        )),
         allow(dead_code)
     )]
     pub(crate) fn read_order(&self, records: usize) -> Vec<usize> {
         let mut order: Vec<usize> = (0..records).collect();
         order.shuffle(&mut StdRng::seed_from_u64(self.inner.read_order_seed));
         order
+    }
+
+    /// Each of a file's `records` records' place in [`Swarm::read_order`],
+    /// by record. A native download writes the file in order, one decrypt
+    /// batch at a time, so it asks for each batch's records by these places:
+    /// readers of one file who start together then hold different records of
+    /// the batch they are all in.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    pub(crate) fn read_places(&self, records: usize) -> Vec<usize> {
+        let mut places = vec![0; records];
+        for (place, record) in self.read_order(records).into_iter().enumerate() {
+            if let Some(slot) = places.get_mut(record) {
+                *slot = place;
+            }
+        }
+        places
     }
 
     /// Joins the room for a file being read, if not in it already, through

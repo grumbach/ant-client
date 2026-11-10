@@ -1160,6 +1160,16 @@ fn adaptive_stream_decrypt_batch_size(
     requested.min(total_chunks.max(1)).max(1)
 }
 
+/// One decrypt batch's records in the order this client asks for them: by
+/// each record's place in its order of the file (see `Swarm::read_places`).
+/// The batch is still decrypted and written in file order, and holds the
+/// same records, so only which of them its fetches start with changes.
+fn in_read_order(batch: &[(usize, XorName)], places: &[usize]) -> Vec<(usize, XorName)> {
+    let mut ordered = batch.to_vec();
+    ordered.sort_by_key(|(index, _)| places.get(*index).copied().unwrap_or(usize::MAX));
+    ordered
+}
+
 /// Payment information for external signing — either wave-batch or merkle.
 // ADR-0004 added the signed commitment fields (`committed_key_count`,
 // `commitment_pin`) to the merkle candidate quotes carried inside
@@ -3460,10 +3470,13 @@ impl Client {
 
         // The retry rounds' clock: tokio's, as their timer.
         let clock_origin = Instant::now();
+        // Readers of the file who start together fetch each batch in orders
+        // of their own, so they hold different records to share.
+        let read_places = self.swarm().read_places(total_chunks);
         let stream = streaming_decrypt_with_batch_size(
             &root_map,
             |batch: &[(usize, XorName)]| {
-                let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
+                let batch_owned = in_read_order(batch, &read_places);
                 let fetch_context = FileDownloadFetchContext {
                     total_chunks,
                     peer_count,
@@ -4079,6 +4092,29 @@ mod tests {
         let batch_size = adaptive_stream_decrypt_batch_size(1_000, 64, 10, Some(u64::MAX));
 
         assert_eq!(batch_size, 64 * DOWNLOAD_STREAM_BATCH_FETCH_MULTIPLIER);
+    }
+
+    #[test]
+    fn a_batch_is_asked_for_in_the_clients_order_and_keeps_its_records() {
+        // Records 4..8 of a file whose order asks for 7, 5, 4, 6 among them.
+        let places = [3, 9, 0, 6, 5, 2, 7, 1, 8, 4];
+        let batch: Vec<(usize, XorName)> = (4..8)
+            .map(|index| (index, XorName([u8::try_from(index).unwrap_or(0); 32])))
+            .collect();
+        let ordered = in_read_order(&batch, &places);
+        let indices: Vec<usize> = ordered.iter().map(|(index, _)| *index).collect();
+        assert_eq!(indices, vec![7, 5, 4, 6]);
+        // Same records with the same names, only reordered.
+        let mut sorted = ordered;
+        sorted.sort_by_key(|(index, _)| *index);
+        assert_eq!(sorted, batch);
+        // A record past the order's end goes last rather than failing.
+        let past = [(10, XorName([10; 32])), (4, XorName([4; 32]))];
+        let indices: Vec<usize> = in_read_order(&past, &places)
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+        assert_eq!(indices, vec![4, 10]);
     }
 
     #[test]
