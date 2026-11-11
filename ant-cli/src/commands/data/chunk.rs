@@ -7,12 +7,15 @@ use clap::Subcommand;
 use tracing::info;
 
 use ant_core::data::client::chunk::ChunkPeerGetResult;
-use ant_core::data::{Client, DataChunk, Error as DataError, MAX_CHUNK_SIZE};
+use ant_core::data::{
+    validate_chunk_upload, Client, DataChunk, Error as DataError, MAX_CHUNK_SIZE,
+};
 
 /// Chunk subcommands.
 #[derive(Subcommand, Debug)]
 pub enum ChunkAction {
-    /// Store a single chunk. Reads from FILE or stdin.
+    /// Store a single opaque chunk. For ordinary files, use `ant file upload`.
+    /// Reads from FILE or stdin.
     Put {
         /// Input file (reads from stdin if omitted).
         file: Option<PathBuf>,
@@ -37,17 +40,25 @@ pub enum ChunkAction {
 }
 
 impl ChunkAction {
-    pub async fn execute(self, client: &Client) -> anyhow::Result<()> {
+    /// Read PUT bytes once and reject recognizable files before client setup.
+    pub fn read_put_input(&self) -> anyhow::Result<Option<Bytes>> {
+        let Self::Put { file } = self else {
+            return Ok(None);
+        };
+        let content = Bytes::from(read_input(file.as_deref())?);
+        validate_chunk_upload(&content).map_err(chunk_put_error)?;
+        Ok(Some(content))
+    }
+
+    pub async fn execute(self, client: &Client, input: Option<Bytes>) -> anyhow::Result<()> {
         match self {
-            ChunkAction::Put { file } => {
-                let content = read_input(file.as_deref())?;
+            ChunkAction::Put { .. } => {
+                let content =
+                    input.ok_or_else(|| anyhow::anyhow!("chunk input was not prepared"))?;
                 let content_len = content.len();
                 info!("Storing single chunk ({content_len} bytes)");
 
-                let address = client
-                    .chunk_put(Bytes::from(content))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Chunk put failed: {e}"))?;
+                let address = client.chunk_put(content).await.map_err(chunk_put_error)?;
 
                 let hex_addr = hex::encode(address);
                 info!("Chunk stored at {hex_addr}");
@@ -94,6 +105,16 @@ impl ChunkAction {
             }
         }
         Ok(())
+    }
+}
+
+fn chunk_put_error(error: DataError) -> anyhow::Error {
+    let rejected = matches!(error, DataError::ChunkUploadRejected { .. });
+    let error = anyhow::Error::new(error);
+    if rejected {
+        error.context("Chunk put failed; use `ant file upload` to self-encrypt ordinary files")
+    } else {
+        error.context("Chunk put failed")
     }
 }
 

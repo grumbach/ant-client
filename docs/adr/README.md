@@ -20,6 +20,8 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 
 ## Index
 
+- [ADR-0008: Preflight chunk headers and preserve node admission rejections](./ADR-0008-chunk-header-preflight-and-rejections.md)
+
 - [ADR-0001: Adopt Architecture Decision Records](./ADR-0001-adopt-architecture-decision-records.md)
 - [ADR-0002: Client fallback for full-node shunning](./ADR-0002-client-fallback-for-full-node-shunning.md)
 - [ADR-0003: Multi-batch external Merkle signing](./ADR-0003-multi-batch-external-merkle-signing.md)

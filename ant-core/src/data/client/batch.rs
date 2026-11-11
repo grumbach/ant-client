@@ -170,6 +170,7 @@ impl ChunkPaymentPlan {
 
     /// Bind externally staged bytes to the address and size that were quoted.
     pub fn with_content(self, content: Bytes) -> Result<PreparedChunk> {
+        crate::upload_validation::validate_chunk_upload(&content)?;
         if content.len() as u64 != self.data_size || compute_address(&content) != self.address {
             return Err(Error::InvalidData(
                 "staged chunk differs from its payment plan".into(),
@@ -210,6 +211,8 @@ pub struct WaveResult {
     pub stored: Vec<XorName>,
     /// Chunks that failed to store after all retries.
     pub failed: Vec<(XorName, String)>,
+    /// A terminal chunk-admission rejection; do not pay for subsequent waves.
+    pub terminal_error: Option<Error>,
     /// Sum of store-RPC attempts across all chunks in this wave (>= stored.len() + failed.len()).
     pub chunk_attempts_total: usize,
     /// Per-chunk wall-clock (ms) from first attempt to successful store. Only populated for stored chunks.
@@ -425,6 +428,7 @@ impl Client {
     ///
     /// Returns an error if quote collection or payment construction fails.
     pub async fn prepare_chunk_payment(&self, content: Bytes) -> Result<Option<PreparedChunk>> {
+        crate::upload_validation::validate_chunk_upload(&content)?;
         // A refusal established by any earlier upload on this client stops this
         // one before it quotes. The verdict is about this build, not about one
         // operation, so the wave path has to honour it exactly as the
@@ -506,6 +510,9 @@ impl Client {
         &self,
         prepared: Vec<PreparedChunk>,
     ) -> Result<(Vec<PaidChunk>, String, u128)> {
+        for chunk in &prepared {
+            crate::upload_validation::validate_chunk_upload(&chunk.content)?;
+        }
         if prepared.is_empty() {
             return Ok((Vec::new(), "0".to_string(), 0));
         }
@@ -664,6 +671,8 @@ impl Client {
     ) -> WaveResult {
         let mut stored = Vec::new();
         let mut to_retry = paid_chunks;
+        let mut terminal_failed = Vec::new();
+        let mut terminal_error = None;
 
         // Per-chunk first-seen timestamps, keyed by chunk address.
         // Inserted on first sight; never overwritten so wall-clock spans
@@ -758,6 +767,10 @@ impl Client {
                             });
                         }
                     }
+                    Err(e @ Error::ChunkUploadRejected { .. }) => {
+                        terminal_failed.push((chunk.address, e.to_string()));
+                        terminal_error.get_or_insert(e);
+                    }
                     Err(e) => failed_this_round.push((chunk, e.to_string())),
                 }
             }
@@ -765,7 +778,8 @@ impl Client {
             if failed_this_round.is_empty() {
                 let result = WaveResult {
                     stored,
-                    failed: Vec::new(),
+                    failed: terminal_failed,
+                    terminal_error,
                     chunk_attempts_total,
                     store_durations_ms,
                     retries_per_chunk,
@@ -775,13 +789,14 @@ impl Client {
             }
 
             if attempt == crate::client_engine::STORE_MAX_RETRIES {
-                let failed = failed_this_round
+                let failed = terminal_failed
                     .into_iter()
-                    .map(|(c, e)| (c.address, e))
+                    .chain(failed_this_round.into_iter().map(|(c, e)| (c.address, e)))
                     .collect();
                 let result = WaveResult {
                     stored,
                     failed,
+                    terminal_error,
                     chunk_attempts_total,
                     store_durations_ms,
                     retries_per_chunk,
@@ -801,7 +816,8 @@ impl Client {
         // Unreachable due to loop structure, but satisfy the compiler.
         let result = WaveResult {
             stored,
-            failed: Vec::new(),
+            failed: terminal_failed,
+            terminal_error,
             chunk_attempts_total,
             store_durations_ms,
             retries_per_chunk,

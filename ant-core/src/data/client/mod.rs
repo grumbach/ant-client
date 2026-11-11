@@ -363,6 +363,7 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         // application layer (payment/disk/quote/pool). Not a local
         // capacity signal; recorded but must not push the limiter down.
         | Error::RemotePut { .. }
+        | Error::ChunkUploadRejected { .. }
         // A close-group PUT shortfall caused purely by dial/relay churn
         // (dead/stale relayed peer addresses), with no PUT-response
         // timeouts to signal local backpressure. Remote peer churn, not
@@ -1100,6 +1101,12 @@ mod tests {
     #[test]
     fn classify_error_covers_all_variants() {
         let cases: Vec<(Error, Outcome)> = vec![
+            (
+                Error::ChunkUploadRejected {
+                    address: "abcd".into(),
+                },
+                Outcome::ApplicationError,
+            ),
             (Error::Timeout("t".to_string()), Outcome::Timeout),
             (Error::Network("n".to_string()), Outcome::NetworkError),
             (
@@ -1314,6 +1321,7 @@ mod tests {
             | Error::BadQuoteCommitment { .. }
             | Error::MerkleBatchTooLarge { .. }
             | Error::RemotePut { .. }
+            | Error::ChunkUploadRejected { .. }
             | Error::ClientUpdateRequired(_)
             | Error::StorerUpdateRequired(_)
             | Error::PointerFinal(_)

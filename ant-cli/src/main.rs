@@ -158,9 +158,10 @@ async fn run() -> anyhow::Result<()> {
             result?;
         }
         Commands::Chunk { action } => {
+            let input = action.read_put_input()?;
             let needs_wallet = matches!(action, commands::data::ChunkAction::Put { .. });
             let client = build_data_client(&data_ctx, needs_wallet, json, None, None).await?;
-            let result = action.execute(&client).await;
+            let result = action.execute(&client, input).await;
             client.save_peer_cache().await;
             client.save_adaptive_snapshot();
             result?;

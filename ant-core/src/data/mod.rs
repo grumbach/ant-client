@@ -10,6 +10,7 @@ pub mod network;
 #[cfg(feature = "native")]
 pub mod peer_cache;
 
+pub use crate::upload_validation::validate_chunk_upload;
 pub use client::cache::ChunkCache;
 pub use client::{Client, ClientConfig};
 pub use error::{Error, Result};

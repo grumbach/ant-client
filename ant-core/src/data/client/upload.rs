@@ -316,6 +316,7 @@ impl Client {
                 ));
             }
             crate::record::verify(&record.address, &bytes).map_err(Error::InvalidData)?;
+            crate::upload_validation::validate_chunk_upload(&bytes)?;
         }
         let total = records.len();
         let mut unique = records.to_vec();
@@ -339,6 +340,7 @@ impl Client {
             .collect::<Vec<_>>();
         let mut prefetched = None;
         let mut failed = Vec::new();
+        let mut fatal_cause = None;
         for (wave_index, wave) in waves.iter().enumerate() {
             let plans = match prefetched.take() {
                 Some(plans) => plans?,
@@ -453,17 +455,22 @@ impl Client {
             prefetched = next;
             let mut fatal = false;
             for (address, result) in results {
-                let result = match result {
+                let mut result = match result {
                     Ok(result) => result,
                     Err(error) => {
                         // Preserve this wave's settled spend and completed stores,
                         // but do not pay another wave after a local byte/proof failure.
                         fatal = true;
                         failed.push((address, error.to_string()));
+                        fatal_cause.get_or_insert(error);
                         continue;
                     }
                 };
                 outcome.stats.absorb(&result);
+                if let Some(error) = result.terminal_error.take() {
+                    fatal = true;
+                    fatal_cause.get_or_insert(error);
+                }
                 outcome.addresses.extend(result.stored);
                 failed.extend(result.failed);
             }
@@ -487,7 +494,7 @@ impl Client {
                     storage_cost_atto: outcome.amount.to_string(),
                     gas_cost_wei: outcome.gas,
                 }),
-                cause: None,
+                cause: fatal_cause.map(Box::new),
             });
         }
         Ok(std::mem::take(outcome))
@@ -659,7 +666,8 @@ impl Client {
         .await?;
         outcome.addresses.extend(result.stored_addresses);
         merge_stats(&mut outcome.stats, result.stats);
-        let mut fatal = result.fatal.map(|e| e.to_string());
+        let mut fatal_cause = result.fatal;
+        let mut fatal = fatal_cause.as_ref().map(ToString::to_string);
         let mut failed = result.failed_addresses;
         if fatal.is_none() && !failed.is_empty() {
             let result = merkle_deferred_retry(
@@ -676,6 +684,7 @@ impl Client {
             merge_stats(&mut outcome.stats, result.stats);
             failed = result.failed_addresses;
             fatal = result.fatal;
+            fatal_cause = result.fatal_cause;
         }
         adapter.stored(outcome.addresses.len(), total);
         if fatal.is_some() || !failed.is_empty() {
@@ -708,7 +717,7 @@ impl Client {
                 reason: fatal.unwrap_or_else(|| {
                     "Merkle storage short of quorum after deferred retries".into()
                 }),
-                cause: None,
+                cause: fatal_cause.map(Box::new),
             });
         }
         records.retain(|r| !merkle.contains_key(&r.address));
@@ -1141,6 +1150,100 @@ fn merge_stats(total: &mut WaveAggregateStats, next: WaveAggregateStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn shared_upload_preflight_rejects_file_bytes_before_payment() {
+        use ant_protocol::transport::{CoreNodeConfig, P2PNode};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Source {
+            content: Bytes,
+            payments: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl UploadAdapter for Source {
+            async fn load(&self, _: UploadRecord) -> Result<Bytes> {
+                Ok(self.content.clone())
+            }
+            async fn pay(&self, _: &[ChunkPaymentPlan]) -> Result<UploadPayment> {
+                self.payments.fetch_add(1, Ordering::Relaxed);
+                Err(Error::Payment("payment callback must not run".into()))
+            }
+        }
+        let config = CoreNodeConfig::builder()
+            .port(0)
+            .local(true)
+            .build()
+            .unwrap();
+        let node = P2PNode::new(config).await.unwrap();
+        let client = Client::from_node(std::sync::Arc::new(node), Default::default());
+        let content = Bytes::from_static(b"\x89PNG\r\n\x1a\n");
+        let record = UploadRecord {
+            address: ant_protocol::compute_address(&content),
+            size: content.len() as u64,
+            index: 0,
+        };
+        let source = Source {
+            content,
+            payments: AtomicUsize::new(0),
+        };
+        let mut state = UploadState::default();
+        let result = client
+            .upload_records(vec![record], &mut state, &source, PaymentMode::Single)
+            .await;
+        assert!(matches!(result, Err(Error::ChunkUploadRejected { .. })));
+        assert_eq!(source.payments.load(Ordering::Relaxed), 0);
+        assert!(state.pending_payment.is_none());
+    }
+
+    #[test]
+    fn terminal_header_rejection_preserves_spend_and_completed_records() {
+        let records = vec![
+            UploadRecord {
+                address: [1; 32],
+                size: 10,
+                index: 0,
+            },
+            UploadRecord {
+                address: [2; 32],
+                size: 10,
+                index: 1,
+            },
+        ];
+        let outcome = UploadOutcome {
+            addresses: vec![[1; 32]],
+            amount: Amount::from(123),
+            gas: 7,
+            ..UploadOutcome::default()
+        };
+        let result = after_spend(
+            Error::ChunkUploadRejected {
+                address: hex::encode([2; 32]),
+            },
+            &records,
+            &outcome,
+        );
+        let Error::PartialUpload {
+            stored,
+            failed,
+            spend,
+            cause,
+            ..
+        } = result
+        else {
+            panic!("must retain partial upload accounting");
+        };
+        assert_eq!(stored, vec![[1; 32]]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, [2; 32]);
+        assert_eq!(spend.storage_cost_atto, "123");
+        assert_eq!(spend.gas_cost_wei, 7);
+        assert!(matches!(
+            cause.as_deref(),
+            Some(Error::ChunkUploadRejected { .. })
+        ));
+    }
 
     fn records(count: u8) -> Vec<UploadRecord> {
         (0..count)

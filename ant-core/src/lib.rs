@@ -9,6 +9,7 @@ mod quote_policy;
 mod quote_validation;
 mod record;
 mod transfer_policy;
+mod upload_validation;
 
 mod client_engine;
 

@@ -58,6 +58,16 @@ pub enum Error {
         source: ant_protocol::ProtocolError,
     },
 
+    /// The chunk's recognizable file header violates node upload admission.
+    ///
+    /// Raised locally before payment, or after a node reports the matching
+    /// rejection. Retrying the same bytes cannot satisfy this policy.
+    #[error("chunk {address} rejected: chunk has a recognizable file header; self-encrypt files before uploading")]
+    ChunkUploadRejected {
+        /// Hex-encoded content address of the rejected chunk.
+        address: String,
+    },
+
     /// A chunk PUT missed its close-group quorum, and the shortfall was
     /// caused by close-group **dial/relay churn** — dead or stale relayed
     /// peer addresses that could not be dialled — with **no** evidence of
@@ -281,6 +291,9 @@ impl Error {
             Self::RemotePut { address, source } => Self::RemotePut {
                 address: address.clone(),
                 source: source.clone(),
+            },
+            Self::ChunkUploadRejected { address } => Self::ChunkUploadRejected {
+                address: address.clone(),
             },
             Self::CloseGroupShortfall(m) => Self::CloseGroupShortfall(m.clone()),
             Self::InvalidData(m) => Self::InvalidData(m.clone()),

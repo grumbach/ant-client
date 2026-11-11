@@ -19,6 +19,8 @@ async-trait = "0.1"
 blake3 = "1"
 base64 = "0.22"
 bytes = "1"
+# Mirrors the node's bounded upload admission policy; no deep readers.
+file-format = { version = "0.29", default-features = false }
 hex = "0.4"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }

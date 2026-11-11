@@ -220,6 +220,7 @@ use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use crate::data::network::{send_and_await_chunk_response, ChunkRequest, RequestDispatched};
+use crate::upload_validation::{validate_chunk_upload, FILE_HEADER_REJECTION};
 use ant_protocol::evm::{QuoteHash, TxHash};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{
@@ -269,6 +270,7 @@ use crate::transfer_policy::{PutRejection, PutShortfall};
 /// dial/relay failure (remote churn).
 fn classify_put_failure(error: &Error) -> PutRejection {
     match error {
+        Error::ChunkUploadRejected { .. } => PutRejection::OtherRemote,
         Error::RemotePut { source, .. } => match source {
             ProtocolError::StorageFailed(_) => PutRejection::Full,
             ProtocolError::PaymentFailed(_) => PutRejection::PriceFloor,
@@ -286,6 +288,23 @@ fn classify_put_failure(error: &Error) -> PutRejection {
         // local-capacity signal.
         _ => PutRejection::Dial,
     }
+}
+
+/// Decode the fixed node admission response without treating it as disk-full.
+fn put_response_error(address: String, source: ProtocolError) -> Error {
+    if matches!(&source, ProtocolError::StorageFailed(message) if message == FILE_HEADER_REJECTION)
+    {
+        Error::ChunkUploadRejected { address }
+    } else {
+        Error::RemotePut { address, source }
+    }
+}
+
+/// A single peer cannot turn a recoverable shortfall into a terminal verdict.
+fn corroborated_upload_rejection(rejections: usize, address: &XorName) -> Option<Error> {
+    (rejections >= CLOSE_GROUP_MAJORITY).then(|| Error::ChunkUploadRejected {
+        address: hex::encode(address),
+    })
 }
 
 /// Decide the error for a close-group store that fell short of quorum.
@@ -661,6 +680,7 @@ impl Client {
     ///
     /// Returns an error if payment or the network operation fails.
     pub async fn chunk_put(&self, content: Bytes) -> Result<XorName> {
+        validate_chunk_upload(&content)?;
         let address = compute_address(&content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
@@ -700,6 +720,7 @@ impl Client {
         content: Bytes,
         dead_count: usize,
     ) -> Result<XorName> {
+        validate_chunk_upload(&content)?;
         let address = compute_address(&content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
@@ -737,6 +758,7 @@ impl Client {
         proof: Vec<u8>,
         peers: &[(PeerId, Vec<MultiAddr>)],
     ) -> Result<XorName> {
+        validate_chunk_upload(&content)?;
         let address = compute_address(&content);
 
         let outcome = crate::client_engine::quorum_with_fallback(
@@ -764,8 +786,12 @@ impl Client {
         let mut timeout = 0usize;
         let mut dial = 0usize;
         let mut first_app_rejection: Option<Error> = None;
+        let mut header_rejections = std::collections::HashSet::new();
 
         for ((peer_id, _), error) in outcome.failures {
+            if matches!(error, Error::ChunkUploadRejected { .. }) {
+                header_rejections.insert(peer_id);
+            }
             warn!("Failed to store chunk on {peer_id}: {error}");
             failures.push(format!("{peer_id}: {error}"));
             match classify_put_failure(&error) {
@@ -792,6 +818,10 @@ impl Client {
                 hex::encode(address)
             );
             return Ok(address);
+        }
+
+        if let Some(error) = corroborated_upload_rejection(header_rejections.len(), &address) {
+            return Err(error);
         }
 
         // Quorum not reached. A timeout-bearing shortfall is genuine local
@@ -842,6 +872,7 @@ impl Client {
         target_peer: &PeerId,
         peer_addrs: &[MultiAddr],
     ) -> Result<XorName> {
+        validate_chunk_upload(&content)?;
         let address = compute_address(&content);
         let node = self.network();
         let timeout =
@@ -893,10 +924,7 @@ impl Client {
                     // responded, so the transport round-trip succeeded —
                     // this is an application-level rejection and must not
                     // suppress the store AIMD limiter (V2-468).
-                    Some(Err(Error::RemotePut {
-                        address: addr_hex.clone(),
-                        source: e,
-                    }))
+                    Some(Err(put_response_error(addr_hex.clone(), e)))
                 }
                 _ => None,
             },
@@ -1553,6 +1581,59 @@ mod tests {
     const TEST_XORNAME_BYTE_LEN: usize = 32;
     /// Last byte position in the test XOR distance arrays.
     const TEST_DISTANCE_TAIL_INDEX: usize = TEST_XORNAME_BYTE_LEN - 1;
+
+    #[test]
+    fn header_rejections_are_typed_and_do_not_mean_disk_full() {
+        let rejected = put_response_error(
+            "abcd".into(),
+            ProtocolError::StorageFailed(FILE_HEADER_REJECTION.into()),
+        );
+        assert!(matches!(&rejected, Error::ChunkUploadRejected { address } if address == "abcd"));
+        assert!(matches!(
+            classify_put_failure(&rejected),
+            PutRejection::OtherRemote
+        ));
+        assert_eq!(
+            super::super::classify_error(&rejected),
+            Outcome::ApplicationError
+        );
+        assert_eq!(rejected.duplicate().to_string(), rejected.to_string());
+        assert!(matches!(
+            put_response_error(
+                "abcd".into(),
+                ProtocolError::StorageFailed("disk full".into())
+            ),
+            Error::RemotePut { .. }
+        ));
+        for count in 0..CLOSE_GROUP_MAJORITY {
+            assert!(corroborated_upload_rejection(count, &[7; 32]).is_none());
+        }
+        assert!(matches!(
+            corroborated_upload_rejection(CLOSE_GROUP_MAJORITY, &[7; 32]),
+            Some(Error::ChunkUploadRejected { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn one_header_rejecting_peer_does_not_prevent_a_successful_quorum() {
+        let outcome = crate::client_engine::quorum_with_fallback(
+            0..CLOSE_GROUP_MAJORITY + 1,
+            CLOSE_GROUP_MAJORITY,
+            |peer| async move {
+                if peer == 0 {
+                    Err(put_response_error(
+                        "abcd".into(),
+                        ProtocolError::StorageFailed(FILE_HEADER_REJECTION.into()),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(outcome.reached);
+        assert_eq!(outcome.successful_targets.len(), CLOSE_GROUP_MAJORITY);
+    }
 
     #[test]
     fn classify_put_failure_maps_remote_timeout_and_dial_reasons() {

@@ -206,6 +206,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run unit tests
         run: cargo test --lib --all
+      - name: Run CLI chunk upload rejection tests
+        run: cargo test --locked -p ant-cli --test chunk_upload_rejection
       - name: Run self-encryption unit tests
         run: cargo test -p ant-core --test unit_self_encrypt
       - name: Run merkle unit tests

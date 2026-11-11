@@ -1,5 +1,5 @@
 import init, {
-  BrowserNetworkClient, createFileLink, createManifest, decodeManifest, encryptPublicFile, parseManifestLink,
+  BrowserNetworkClient, contentAddress, createFileLink, createManifest, decodeManifest, encryptPublicFile, parseManifestLink,
   pointerAddress, recoverPointerPayment,
 } from "../wasm-tests/pkg/ant_core.js";
 import { Contract, JsonRpcProvider } from "ethers";
@@ -75,6 +75,51 @@ const chainWallet = async (payment, rpcUrl) => {
     return receipt;
   };
   return wallet;
+};
+// Real RTC sessions and a local-chain wallet: raw file errors must explain
+// the correction before payment, while the same file works after encryption.
+globalThis.runUploadAdmissionIntegration = async ({ endpoint, payment, rpcUrl }) => {
+  const client = new BrowserNetworkClient([endpoint]);
+  const wallet = await chainWallet(payment, rpcUrl);
+  const save = value => localStorage.setItem("admission-checkpoint", value);
+  const messages = [];
+  const inputs = [
+    Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10]),
+    new TextEncoder().encode("SQLite format 3\0"),
+    new TextEncoder().encode("<?xml version='1.0'?><root/>"),
+    Uint8Array.from([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255]),
+  ];
+  let reader;
+  try {
+    const hello = await client.connect(payment);
+    for (const bytes of inputs) {
+      try {
+        await client.uploadRecords({ records: [{ address: contentAddress(bytes), size: bytes.length }] },
+          payment, () => bytes, wallet.pay, undefined, undefined, save);
+        throw new Error("raw file upload unexpectedly succeeded");
+      } catch (error) { messages.push(String(error)); }
+    }
+    const paymentsBeforeEncryption = wallet.payments;
+    const original = new Uint8Array(4096).fill(0xa5);
+    original.set(inputs[0]);
+    const encrypted = encryptPublicFile(original);
+    const staged = { name: "admission.png", content_type: "image/png", address: encrypted.address,
+      records: encrypted.records.map(record => ({ address: record.address, size: record.content.length })) };
+    const uploaded = await client.uploadStagedPublicFile(staged, payment,
+      index => encrypted.records[index].content, wallet.pay, undefined, undefined, save, "single");
+    client.close();
+    reader = new BrowserNetworkClient([endpoint]);
+    const downloaded = await reader.downloadPublicFile(uploaded.file.address, 4);
+    return { hello: hello.type, messages, paymentsBeforeEncryption, payments: wallet.payments,
+      replicas: uploaded.file.replicas, size: downloaded.content.length,
+      matches: downloaded.content.length === original.length &&
+        downloaded.content.every((byte, index) => byte === original[index]) };
+  } finally {
+    client.close(); client.free();
+    if (reader) { reader.close(); reader.free(); }
+    wallet.destroy();
+    localStorage.removeItem("admission-checkpoint");
+  }
 };
 const chunk = n => n.toString(16).padStart(2, "0").repeat(32);
 // A node admits 16 requests a second from one browser session (ADR-0015)

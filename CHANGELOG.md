@@ -50,6 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#249).
 
 ### Fixed
+- Raw chunk uploads now preflight recognizable file headers before quoting or
+  paying, including the shared native/browser upload pipeline. Use `ant file
+  upload` for ordinary files; raw chunk APIs keep their opaque-byte semantics.
+  The corresponding node rejection surfaces as `Error::ChunkUploadRejected`
+  instead of disk-full, and corroborated rejections stop chunk retries and
+  payments for later waves while preserving completed stores and settled spend.
+  A single rejecting peer still permits fallback to a successful quorum.
+  Consumers matching `data::Error` exhaustively must handle the new variant;
+  consumers constructing `WaveResult` must set its new `terminal_error` field
+  (`None` for ordinary results). CLI file and stdin inputs are checked before
+  wallet/network setup, so missing credentials or bootstrap configuration do not
+  hide the actionable rejection; `data::validate_chunk_upload` exposes the same
+  local preflight to other callers (#254).
 - `ant node daemon info` and `ant node daemon start` no longer mistake a stale PID file for a
   running daemon (V2-1655). A daemon that dies without cleaning up (a reboot, an OOM kill)
   leaves its PID and port files behind, and once the PID is reused by an unrelated process,

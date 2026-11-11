@@ -2037,6 +2037,8 @@ pub(crate) struct DeferredRetryOutcome {
     /// caller surfaces this as `PartialUpload` preserving everything stored so
     /// far, mirroring the wave path's fatal handling.
     pub fatal: Option<String>,
+    /// Typed terminal cause retained for partial-upload error reporting.
+    pub fatal_cause: Option<Error>,
     /// Aggregate store stats merged across rounds, with each round's successes
     /// already mapped into its [`deferred_round_histogram_slot`].
     pub stats: crate::data::client::batch::WaveAggregateStats,
@@ -2144,6 +2146,7 @@ where
             // chunks still in flight / not yet launched are reconciled against
             // the full address list by the caller's `partial_upload_after_fatal`.
             outcome.fatal = Some(fatal.to_string());
+            outcome.fatal_cause = Some(fatal);
             outcome.failed = round_outcome.failed_addresses.len();
             outcome.failed_addresses = round_outcome.failed_addresses;
             return Ok(outcome);
@@ -3833,5 +3836,59 @@ mod tests {
 
         // Every pool succeeded, so there is nothing to report.
         assert!(PoolVerdict::default().into_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn header_rejection_is_terminal_for_merkle_storage() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = merkle_store_with_retry(
+            vec![[7; 32]],
+            || 1,
+            3,
+            std::time::Duration::ZERO,
+            None,
+            0,
+            1,
+            |address| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    Err(Error::ChunkUploadRejected {
+                        address: hex::encode(address),
+                    })
+                }
+            },
+        )
+        .await
+        .expect("store outcome");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(matches!(
+            result.fatal,
+            Some(Error::ChunkUploadRejected { .. })
+        ));
+        assert_eq!(result.failed_addresses.len(), 1);
+        calls.store(0, std::sync::atomic::Ordering::Relaxed);
+        let deferred = merkle_deferred_retry(
+            vec![([7; 32], "earlier quorum shortfall".into())],
+            &[0, 0],
+            |_| 1,
+            None,
+            0,
+            1,
+            |address| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    Err(Error::ChunkUploadRejected {
+                        address: hex::encode(address),
+                    })
+                }
+            },
+        )
+        .await
+        .expect("deferred outcome");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(matches!(
+            deferred.fatal_cause,
+            Some(Error::ChunkUploadRejected { .. })
+        ));
     }
 }

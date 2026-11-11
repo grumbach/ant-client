@@ -3850,6 +3850,7 @@ mod tests {
         let wave_result = WaveResult {
             stored: vec![a],
             failed: Vec::new(),
+            terminal_error: None,
             chunk_attempts_total: 1,
             store_durations_ms: vec![5],
             retries_per_chunk: vec![0],
@@ -3885,6 +3886,7 @@ mod tests {
         let wave_result = WaveResult {
             stored: vec![a],
             failed: vec![(b, "quorum".into()), (c, "quorum".into())],
+            terminal_error: None,
             chunk_attempts_total: 3,
             store_durations_ms: vec![5],
             retries_per_chunk: vec![0],

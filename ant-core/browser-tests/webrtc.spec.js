@@ -1,5 +1,28 @@
 import { test, expect } from "@playwright/test";
 import { writeFile } from "node:fs/promises";
+test("real Chromium rejects recognizable files clearly before paying and uploads them self-encrypted", async ({ page, request }) => {
+  const manifest = await (await request.get("http://127.0.0.1:35000/api/browser-manifest.json")).json();
+  const info = await (await request.get("http://127.0.0.1:35000/api/info")).json();
+  expect(info.evm.network).toBe("local-anvil");
+  const errors = []; page.on("pageerror", error => errors.push(error.message));
+  await page.goto("/");
+  await page.waitForFunction(() => typeof globalThis.runUploadAdmissionIntegration === "function");
+  const result = await page.evaluate(options => globalThis.runUploadAdmissionIntegration(options), {
+    endpoint: manifest.endpoints[0], payment: manifest.payment, rpcUrl: info.evm.rpc_url,
+  });
+  expect(result.hello).toBe("hello");
+  expect(result.messages).toHaveLength(4);
+  for (const message of result.messages) {
+    expect(message).toContain("recognizable file header");
+    expect(message).toContain("self-encrypt files before uploading");
+  }
+  expect(result.paymentsBeforeEncryption).toBe(0);
+  expect(result.payments).toBe(1);
+  expect(result.replicas).toBeGreaterThanOrEqual(4);
+  expect(result.size).toBe(4096);
+  expect(result.matches).toBe(true);
+  expect(errors).toEqual([]);
+});
 test("real Chromium authenticates, resumes one paid upload, and downloads by address", async ({ page, request }) => {
   const manifest = await (await request.get("http://127.0.0.1:35000/api/browser-manifest.json")).json();
   const info = await (await request.get("http://127.0.0.1:35000/api/info")).json();
