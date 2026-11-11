@@ -261,6 +261,9 @@ struct BrowserClientLease {
 
 struct PoolAvailability {
     closed: Cell<bool>,
+    /// Whether the client stopped sharing (`stopSwarm`): no swarm room's
+    /// lookup asks a node anything more, though the pool stays open.
+    swarm_stopped: Cell<bool>,
     sender: watch::Sender<()>,
 }
 
@@ -285,6 +288,21 @@ impl PoolAvailability {
 
     fn close(&self) {
         self.closed.set(true);
+        self.sender.send_replace(());
+    }
+
+    /// Resolves once the client has stopped sharing; at once if it has.
+    async fn wait_swarm_stopped(&self) {
+        let mut changed = self.sender.subscribe();
+        while !self.swarm_stopped.get() {
+            if changed.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
+    fn stop_swarm(&self) {
+        self.swarm_stopped.set(true);
         self.sender.send_replace(());
     }
 }
@@ -333,8 +351,16 @@ impl BrowserClientLease {
     /// an admitted transport exchange. Drain that exchange under its ordinary
     /// deadlines so its authenticated association (or actual dial failure) can
     /// be reused. Queued work is still cancelled, and closing the pool aborts
-    /// even an in-progress connection setup immediately.
-    async fn lookup(self, target: String, count: usize) -> Result<Vec<BrowserNode>, String> {
+    /// even an in-progress connection setup immediately. A swarm `room`'s
+    /// lookup also stops when the client stops sharing: the stop is looked at
+    /// before the request in every poll of the lookup's task, so no request
+    /// for the room's key starts after it.
+    async fn lookup(
+        self,
+        target: String,
+        count: usize,
+        room: bool,
+    ) -> Result<Vec<BrowserNode>, String> {
         let (mut sender, receiver) = oneshot::channel();
         wasm_bindgen_futures::spawn_local(async move {
             let result = {
@@ -364,9 +390,25 @@ impl BrowserClientLease {
                     };
                     client.find_node(&target, count).await
                 };
-                match select(Box::pin(request), Box::pin(self.availability.wait_closed())).await {
-                    Either::Left((result, _)) => result,
-                    Either::Right(_) => Err("WebRTC client pool is closed".to_string()),
+                let request = async {
+                    match select(Box::pin(request), Box::pin(self.availability.wait_closed())).await
+                    {
+                        Either::Left((result, _)) => result,
+                        Either::Right(_) => Err("WebRTC client pool is closed".to_string()),
+                    }
+                };
+                if room {
+                    match select(
+                        Box::pin(self.availability.wait_swarm_stopped()),
+                        Box::pin(request),
+                    )
+                    .await
+                    {
+                        Either::Left(_) => Err("the client stopped sharing".to_string()),
+                        Either::Right((result, _)) => result,
+                    }
+                } else {
+                    request.await
                 }
             };
             let _ = sender.send(result);
@@ -407,6 +449,7 @@ impl BrowserClientPool {
             clock: Cell::new(0),
             availability: Rc::new(PoolAvailability {
                 closed: Cell::new(false),
+                swarm_stopped: Cell::new(false),
                 sender: availability_tx,
             }),
             preconnecting: RefCell::new(HashSet::new()),
@@ -2179,6 +2222,7 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                             .lookup(
                                 target.clone(),
                                 count.max(crate::quote_policy::SINGLE_NODE_WITNESSED_VIEW_COUNT),
+                                warm == Warm::No,
                             )
                             .await
                     }
@@ -3078,11 +3122,12 @@ impl BrowserNetworkClient {
     #[wasm_bindgen(js_name = stopSwarm)]
     pub fn stop_swarm(&self) {
         self.shared.swarm().shutdown();
+        self.inner.pool.availability.stop_swarm();
     }
 
     /// Close all pooled WebRTC associations.
     pub fn close(&self) {
-        self.shared.swarm().shutdown();
+        self.stop_swarm();
         self.inner.pool.close();
     }
 }

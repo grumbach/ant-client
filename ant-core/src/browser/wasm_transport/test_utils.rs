@@ -315,6 +315,40 @@ pub async fn test_active_data_lane_capacity(endpoints: JsValue) {
     pool.close();
 }
 
+/// A swarm room's lookup whose task is already queued when the client stops
+/// sharing: the task runs after the stop, on an authenticated session, and
+/// must send no request. Resolves with the lookup's error, or fails if the
+/// lookup asked the node.
+#[wasm_bindgen]
+pub async fn test_room_lookup_queued_at_stop(endpoint: &str) -> Result<String, JsValue> {
+    let pool = BrowserClientPool::new(1).map_err(|error| JsValue::from_str(&error))?;
+    let endpoint = BrowserEndpoint {
+        multiaddr: endpoint.into(),
+    };
+    let lease = pool
+        .client(&endpoint)
+        .await
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    lease
+        .hello()
+        .await
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let mut lookup = Box::pin(lease.lookup("11".repeat(32), 20, true));
+    // The first poll queues the lookup's task; it has not run yet.
+    if futures::poll!(&mut lookup).is_ready() {
+        return Err(JsValue::from_str("the lookup ended before its task ran"));
+    }
+    pool.availability.stop_swarm();
+    let result = lookup.await;
+    pool.close();
+    match result {
+        Ok(_) => Err(JsValue::from_str(
+            "the room's lookup asked the node after the stop",
+        )),
+        Err(error) => Ok(error),
+    }
+}
+
 /// Abandon an admitted lookup exactly as the iterative lookup grace timer does.
 /// A subsequent lookup must reuse the drained session or the actual dial error.
 #[wasm_bindgen]
@@ -324,11 +358,12 @@ pub async fn test_abandoned_lookup(endpoint: &str, close_pool: bool) -> String {
         multiaddr: endpoint.into(),
     };
     let lease = pool.client(&endpoint).await.unwrap();
-    assert!(
-        crate::runtime::timeout(Duration::from_millis(20), lease.lookup("11".repeat(32), 20),)
-            .await
-            .is_err()
-    );
+    assert!(crate::runtime::timeout(
+        Duration::from_millis(20),
+        lease.lookup("11".repeat(32), 20, false),
+    )
+    .await
+    .is_err());
     if close_pool {
         pool.close();
     }
@@ -336,7 +371,7 @@ pub async fn test_abandoned_lookup(endpoint: &str, close_pool: bool) -> String {
     let result = async {
         pool.client(&endpoint)
             .await?
-            .lookup("22".repeat(32), 20)
+            .lookup("22".repeat(32), 20, false)
             .await
     }
     .await;
@@ -362,7 +397,7 @@ pub async fn test_abandoned_queued_lookup(endpoint: &str) {
         crate::runtime::sleep(Duration::from_millis(1)).await;
         assert!(crate::runtime::timeout(
             Duration::from_millis(20),
-            queued.lookup("22".repeat(32), 20),
+            queued.lookup("22".repeat(32), 20, false),
         )
         .await
         .is_err());
@@ -442,6 +477,7 @@ pub struct BrowserTestNode {
     last_put_address: String,
     last_put_quote_hash: String,
     last_get_address: String,
+    last_find_target: String,
     closest_peers: Vec<BrowserNode>,
     put_error: Option<(String, String)>,
     pointers_enabled: bool,
@@ -496,6 +532,7 @@ impl BrowserTestNode {
             last_put_address: String::new(),
             last_put_quote_hash: String::new(),
             last_get_address: String::new(),
+            last_find_target: String::new(),
             closest_peers: Vec::new(),
             put_error: None,
             pointers_enabled: true,
@@ -582,6 +619,10 @@ impl BrowserTestNode {
     pub fn last_get_address(&self) -> String {
         self.last_get_address.clone()
     }
+    /// The target of the last `find_node` request.
+    pub fn last_find_target(&self) -> String {
+        self.last_find_target.clone()
+    }
     pub fn push(&mut self, message: &[u8]) -> Vec<u8> {
         self.received.extend_from_slice(message);
         let Some(expected) = pq_frame_length(&self.received, 8 * 1024 * 1024).unwrap() else {
@@ -662,6 +703,7 @@ impl BrowserTestNode {
                 with_address_records,
             } => {
                 self.last_method = "find_node".into();
+                self.last_find_target = target.clone();
                 let key = parse_lookup_key(&target, "target").unwrap();
                 let mut nodes = self.closest_peers.clone();
                 nodes.sort_by_key(|node| {

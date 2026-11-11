@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BrowserNetworkClient } from "./client-fixture.mjs";
-import { encryptPublicFile } from "./pkg/ant_core.js";
+import { encryptPublicFile, test_room_lookup_queued_at_stop } from "./pkg/ant_core.js";
 import { mockWebRtc } from "./mock-webrtc.mjs";
 
 // An AbortSignal can abort inside one of the operation's own callbacks, which
@@ -129,4 +129,45 @@ test("stopSwarm leaves every room and joins none after, while reads go on", asyn
     await client.joinSwarm(datamap.address);
     assert.equal(client.swarmStats().rooms, 0, "no room joined after");
   } finally { reader?.close(); client.close(); }
+});
+
+// A room's lookup asks several nodes at once, each from a task of its own.
+// stopSwarm while those tasks are under way: none of them asks another node
+// for the room's key after it. A private file's room key is looked up by
+// nothing but its room (its reads ask for its records' addresses).
+test("stopSwarm stops a room's lookup: no node is asked for the room after it", async () => {
+  const records = encrypted.records.slice(0, -1);
+  const roomKey = datamap.address;
+  let client;
+  let stoppedAt;
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({
+    respond(_channel, method) {
+      // The room's first lookup request reaches a node: sharing stops now.
+      if (method !== "find_node" || stoppedAt !== undefined || rtc.requests.at(-1)?.target !== roomKey) return;
+      client.stopSwarm();
+      stoppedAt = rtc.requests.length;
+    },
+  })));
+  for (const store of rtc.stores) for (const record of records) store.set(record.address, record.content);
+  client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  try {
+    reader = await client.openPrivateFile({ data_map: datamap.content });
+    assert.deepEqual(await reader.readRange(0, 10), content.slice(0, 10));
+    for (let waited = 0; stoppedAt === undefined && waited < 10_000; waited += 20) await settle(20);
+    assert.ok(stoppedAt !== undefined, "the room started its lookup");
+    await settle(1_500);
+    assert.equal(client.swarmStats().rooms, 0);
+    const after = rtc.requests.slice(stoppedAt).filter(request => request.method === "find_node" && request.target === roomKey);
+    assert.deepEqual(after, [], "no node is asked for the room's key after stopSwarm");
+  } finally { reader?.close(); client.close(); }
+});
+
+// The schedule the test above cannot force: a room lookup's task is queued
+// on an authenticated session when sharing stops, and runs after the stop.
+test("a room lookup queued when sharing stops asks the node nothing", async () => {
+  const rtc = mockWebRtc([{}]);
+  const error = await test_room_lookup_queued_at_stop(rtc.endpoints[0]);
+  assert.match(error, /stopped sharing/u);
+  assert.deepEqual(rtc.requests.filter(request => request.method === "find_node"), [], "no lookup request sent");
 });
