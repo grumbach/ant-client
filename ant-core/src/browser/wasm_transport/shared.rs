@@ -477,15 +477,24 @@ impl BrowserNetwork for SharedNetworkAdapter {
             let bytes = request
                 .encode()
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
+            // An announce or an answer tells the node a room's key: once the
+            // client stops sharing it is not sent, even by a sender task the
+            // stop did not reach in time. A leave still goes.
+            let guard = matches!(
+                &request.body,
+                ChunkMessageBody::SwarmAnnounceRequest(_) | ChunkMessageBody::SwarmAnswerRequest(_)
+            )
+            .then(|| self.inner.pool.availability.swarm_guard());
             // The transport owns the read permit across cancellation, then
             // returns it through response decoding.
             let (response, _read_permit) = client
-                .request_reserved(
+                .request_guarded(
                     BrowserRequestBody::ChunkProtocol,
                     &bytes,
                     timeout,
                     read_permit,
                     exclusive,
+                    guard,
                 )
                 .await
                 .map_err(rpc_data_error)?;

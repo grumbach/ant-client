@@ -306,6 +306,13 @@ impl PoolAvailability {
         self.swarm_stopped.set(true);
         self.sender.send_replace(());
     }
+
+    /// A guard for a request that tells a node a swarm room's key: once the
+    /// client stops sharing, it is not sent (see [`multiplex::SendGuard`]).
+    fn swarm_guard(self: &Rc<Self>) -> multiplex::SendGuard {
+        let availability = Rc::clone(self);
+        Rc::new(move || availability.swarm_stopped.get())
+    }
 }
 
 impl Deref for BrowserClientLease {
@@ -365,10 +372,7 @@ impl BrowserClientLease {
         let (mut sender, receiver) = oneshot::channel();
         // A room's request is not sent once the client stops sharing, even
         // from a task the stop did not reach in time.
-        let guard = room.then(|| {
-            let availability = Rc::clone(&self.availability);
-            Rc::new(move || availability.swarm_stopped.get()) as multiplex::SendGuard
-        });
+        let guard = room.then(|| self.availability.swarm_guard());
         wasm_bindgen_futures::spawn_local(async move {
             let result = {
                 let request = async {

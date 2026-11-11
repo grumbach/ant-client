@@ -315,6 +315,59 @@ pub async fn test_active_data_lane_capacity(endpoints: JsValue) {
     pool.close();
 }
 
+/// A swarm announce handed to its session's sender task, queued when the
+/// client stops sharing: the task runs after the stop and must send
+/// nothing. A GET first opens the authenticated session the announce uses.
+#[wasm_bindgen]
+pub async fn test_swarm_announce_queued_at_stop(endpoint: &str) -> Result<String, JsValue> {
+    let to_js = |error: String| JsValue::from_str(&error);
+    let core = Rc::new(
+        BrowserNetworkCore::new(vec![BrowserEndpoint {
+            multiaddr: endpoint.into(),
+        }])
+        .map_err(to_js)?,
+    );
+    let adapter = SharedNetworkAdapter::new(Rc::clone(&core));
+    let node = parse_webrtc_direct_multiaddr(endpoint).map_err(|error| to_js(error.to_string()))?;
+    let peer = PeerId::from_hex(&node.peer_id).map_err(|error| to_js(error.to_string()))?;
+    let addrs = [endpoint
+        .parse()
+        .map_err(|error| to_js(format!("{error:?}")))?];
+    let timeout = Duration::from_secs(5);
+    let get = ant_protocol::ChunkMessage {
+        request_id: 1,
+        body: ant_protocol::ChunkMessageBody::GetRequest(ant_protocol::ChunkGetRequest::new(
+            [1; 32],
+        )),
+    };
+    let _ = adapter.request(&peer, &addrs, get, timeout).await;
+    let announce = ant_protocol::ChunkMessage {
+        request_id: 2,
+        body: ant_protocol::ChunkMessageBody::SwarmAnnounceRequest(
+            ant_protocol::SwarmAnnounceRequest {
+                room: [7; 32],
+                node: *peer.as_bytes(),
+                membership: 1,
+                offers: Vec::new(),
+                wait_ms: 0,
+            },
+        ),
+    };
+    let mut request = Box::pin(adapter.request(&peer, &addrs, announce, timeout));
+    // The first poll hands the announce to the sender task, queued.
+    if futures::poll!(&mut request).is_ready() {
+        core.pool.close();
+        return Err(to_js("the announce ended before its sender ran".into()));
+    }
+    core.pool.availability.stop_swarm();
+    let result = request.await;
+    core.pool.close();
+    match result {
+        Ok(_) => Err(to_js("the announce was sent after the stop".into())),
+        Err(error) => Ok(error.to_string()),
+    }
+}
+
 /// A guarded request (a swarm room's lookup) handed to its session's sender
 /// task, which is queued when the guard says to stop: the task runs after
 /// the stop and must send nothing. Resolves with the request's error, or
@@ -518,6 +571,8 @@ pub struct BrowserTestNode {
     closest_peers: Vec<BrowserNode>,
     put_error: Option<(String, String)>,
     pointers_enabled: bool,
+    /// Whether it hosts swarm rooms (`swarm_rendezvous`).
+    swarm_enabled: bool,
 }
 
 /// Where the mock keeps a pointer, beside chunks in the same record map.
@@ -573,6 +628,7 @@ impl BrowserTestNode {
             closest_peers: Vec::new(),
             put_error: None,
             pointers_enabled: true,
+            swarm_enabled: false,
         }
     }
     pub fn endpoint(&self) -> String {
@@ -643,6 +699,9 @@ impl BrowserTestNode {
     }
     pub fn set_pointers_enabled(&mut self, enabled: bool) {
         self.pointers_enabled = enabled;
+    }
+    pub fn set_swarm_enabled(&mut self, enabled: bool) {
+        self.swarm_enabled = enabled;
     }
     pub fn set_put_error(&mut self, code: String, message: String) {
         self.put_error = (!code.is_empty()).then_some((code, message));
@@ -729,6 +788,9 @@ impl BrowserTestNode {
                         }
                         if self.pointers_enabled {
                             capabilities.push(POINTER_PROTOCOL_CAPABILITY.into());
+                        }
+                        if self.swarm_enabled {
+                            capabilities.push(SWARM_CAPABILITY.into());
                         }
                         capabilities
                     },
@@ -1219,6 +1281,13 @@ impl BrowserTestNode {
                         address: request.address,
                     },
                 })
+            }
+            Body::SwarmAnnounceRequest(_) if self.swarm_enabled => {
+                // Recorded, then turned away: this node holds no room.
+                self.last_method = "swarm_announce".into();
+                Body::SwarmAnnounceResponse(ant_protocol::SwarmAnnounceResponse::Refused(
+                    ant_protocol::SwarmRefusal::NotHosting,
+                ))
             }
             other => panic!("unsupported mock request: {other:?}"),
         };

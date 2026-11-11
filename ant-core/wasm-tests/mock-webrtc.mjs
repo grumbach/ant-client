@@ -223,6 +223,7 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       channel.server.set_address_v2(channel.options.addressV2 ?? false);
       channel.server.set_uploads_enabled(channel.options.uploads ?? true);
       channel.server.set_pointers_enabled(channel.options.pointers ?? true);
+      channel.server.set_swarm_enabled(channel.options.swarm ?? false);
       if (channel.options.payment) channel.server.set_hello_payment(channel.options.payment);
       channel.server.set_invalid_quote(channel.options.invalidQuote ?? false);
       channel.server.set_committed_key_count(channel.options.keyCount ?? 0);

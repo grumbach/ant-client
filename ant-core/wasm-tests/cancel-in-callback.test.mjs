@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BrowserNetworkClient } from "./client-fixture.mjs";
-import { encryptPublicFile, test_guarded_request_queued_at_stop, test_room_lookup_queued_at_stop } from "./pkg/ant_core.js";
+import { encryptPublicFile, test_guarded_request_queued_at_stop, test_room_lookup_queued_at_stop, test_swarm_announce_queued_at_stop } from "./pkg/ant_core.js";
 import { mockWebRtc } from "./mock-webrtc.mjs";
 
 // An AbortSignal can abort inside one of the operation's own callbacks, which
@@ -179,4 +179,13 @@ test("a room's request whose sender is queued when sharing stops is not sent", a
   const before = () => rtc.requests.filter(request => request.method === "find_node").length;
   await test_guarded_request_queued_at_stop(rtc.endpoints[0]);
   assert.equal(before(), 0, "no lookup request sent");
+});
+
+// An announce, which tells a node the room's key and joins the client to
+// it there, handed to its session's sender task queued when sharing stops.
+test("a swarm announce whose sender is queued when sharing stops is not sent", async () => {
+  const rtc = mockWebRtc([{ swarm: true }]);
+  await test_swarm_announce_queued_at_stop(rtc.endpoints[0]);
+  assert.ok(rtc.requests.some(request => request.method === "get_chunk"), "the session was open");
+  assert.deepEqual(rtc.requests.filter(request => request.method === "swarm_announce"), [], "no announce sent");
 });
