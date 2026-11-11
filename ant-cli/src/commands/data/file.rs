@@ -1239,12 +1239,12 @@ mod tests {
                 reads_hidden: 36,
                 refused_missing: 37,
                 refused_busy_link: 38,
-                refused_busy_reading: 39,
                 refused_busy_uploads: 40,
                 records_served: 7,
                 bytes_served: 8,
                 links: 9,
                 rooms: 10,
+                uploads_at_once: 41,
                 discovery: DiscoveryStats {
                     lookups: 11,
                     announces: 12,
@@ -1301,12 +1301,12 @@ mod tests {
                 "reads_hidden",
                 "refused_missing",
                 "refused_busy_link",
-                "refused_busy_reading",
                 "refused_busy_uploads",
                 "records_served",
                 "bytes_served",
                 "links",
                 "rooms",
+                "uploads_at_once",
                 "discovery",
             ],
         );
@@ -1350,7 +1350,8 @@ mod tests {
         );
         assert_eq!(json["swarm"]["records_from_peers"], 1);
         assert_eq!(json["swarm"]["reads_not_offered"], 33);
-        assert_eq!(json["swarm"]["refused_busy_reading"], 39);
+        assert_eq!(json["swarm"]["refused_busy_uploads"], 40);
+        assert_eq!(json["swarm"]["uploads_at_once"], 41);
         assert_eq!(json["swarm"]["discovery"]["links_failed"], 25);
         assert_eq!(json["swarm_rooms"][0]["records_from_peers"], 26);
     }

@@ -2,7 +2,7 @@
 //! records this client asked it for, and the records it asked this client for.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use ant_protocol::pqc::api::MlDsaPublicKey;
@@ -14,10 +14,11 @@ use web_time::Instant;
 
 use super::room::{count, member_key, name_of, signed_by, Room};
 use super::rtc::{ChannelEvent, ChannelSender};
+use super::uploads::UploadSlot;
 use super::wire::{self, Assembly, Message, MAX_HAVE_ADDRESSES};
 use super::{
     count_one, or_stopped, spawn, update_usize, Counters, DiscoveryCounters, Inner, Pace, PeerRef,
-    Stop, UploadsTaken,
+    Stop,
 };
 use crate::data::XorName;
 
@@ -42,7 +43,7 @@ const SLOW_PEER_PAUSE: std::time::Duration = std::time::Duration::from_secs(30);
 const SETTLE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long sending one record may take before the link is dropped: longer
 /// than any asker waits for it.
-const SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+pub(super) const SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 const _: () = assert!(SEND_DEADLINE.as_secs() > FETCH_TOTAL.as_secs());
 /// Pieces of one record sent before it lets others have the channel: at 16
 /// KiB each, a record waits at most 64 KiB behind another's.
@@ -76,6 +77,8 @@ pub(super) const MAX_PEER_HAS: usize = 16_384;
 pub(super) const INITIAL_HAVE: usize = 4096;
 /// Messages waiting to be sent on one link before it is dropped.
 const MAX_OUTBOX: usize = 1024;
+/// How often a sent record looks whether the channel has emptied.
+const SENT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// What became of one record asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -249,6 +252,33 @@ pub(super) struct Link {
     closed: Stop,
     /// Closed as the duplicate of a link kept.
     settled: AtomicBool,
+    /// Bytes of every message handed to the channel: with what the channel
+    /// still holds, how far its sending has come.
+    handed: AtomicU64,
+    /// Of those, the bytes the swarm has counted as gone (see
+    /// [`Link::sent_since`]).
+    counted: AtomicU64,
+    /// Records handed to the channel whose bytes have not all left it yet,
+    /// each holding its place among the client's sends.
+    draining: Mutex<Drains>,
+    next_draining: AtomicU64,
+}
+
+/// The records a link still drains, and how many asks the peer has made.
+#[derive(Default)]
+struct Drains {
+    /// Asks the peer has made on the link: a send begun before the last of
+    /// them has reached the peer, which asks a link for one record at a
+    /// time.
+    asked: u64,
+    records: Vec<Draining>,
+}
+
+/// A record handed to the channel, its bytes still leaving it, and the
+/// place it holds among the client's sends.
+struct Draining {
+    number: u64,
+    _slot: UploadSlot,
 }
 
 impl Link {
@@ -290,6 +320,10 @@ impl Link {
             sending: tokio::sync::Mutex::new(()),
             closed: Stop::default(),
             settled: AtomicBool::new(false),
+            handed: AtomicU64::new(0),
+            counted: AtomicU64::new(0),
+            draining: Mutex::default(),
+            next_draining: AtomicU64::new(0),
         })
     }
 
@@ -838,6 +872,10 @@ impl Link {
         let Some(inner) = swarm.upgrade() else {
             return;
         };
+        // A peer asks a link for one record at a time: asking again, it has
+        // the last one, and its place is free, whatever the channel says it
+        // still holds.
+        let asked = self.asked_again();
         let record = if inner.room_holds(&self.room, &address) {
             inner.store.get(&address)
         } else {
@@ -872,29 +910,25 @@ impl Link {
             id,
             number,
         };
-        // Fewer records at once while this client's own reads run: its
-        // download needs the CPU and line a record sent takes.
-        let permit = match inner.start_upload() {
-            Ok(permit) => permit,
-            Err(taken) => {
-                drop(transfer);
-                count_one(match taken {
-                    UploadsTaken::WhileReading => &counters.refused_busy_reading,
-                    UploadsTaken::All => &counters.refused_busy_uploads,
-                });
-                self.queue(Message::Busy { id });
-                return;
-            }
+        // As many records at once as the client's upload rate gives each the
+        // rate a peer needs.
+        let Some(slot) = inner.start_upload() else {
+            drop(transfer);
+            count_one(&counters.refused_busy_uploads);
+            self.queue(Message::Busy { id });
+            return;
         };
         let room_counters = Arc::clone(&self.room_counters);
         drop(inner);
         let link = Arc::clone(self);
         spawn(async move {
-            let _permit = permit;
+            let slot = slot;
             let transfer = transfer;
+            let started = Instant::now();
             // A peer that stops reading would hold the send, and its upload
             // slot, for ever: past the deadline the link goes.
             let sending = async {
+                let mut any = false;
                 for (sent, piece) in wire::pieces(id, &record).enumerate() {
                     // Turns go in order only among records already waiting
                     // for one: every few pieces, this record lets the others,
@@ -905,28 +939,65 @@ impl Link {
                     // Looked at last thing before each piece. An asker never
                     // asks again under an id it cancelled (its ids only
                     // grow), so a piece of a cancelled transfer already on
-                    // its way can confuse only an asker that did.
+                    // its way can confuse only an asker that did. What it
+                    // sent before still has to leave the channel.
                     if !transfer.wanted() {
-                        return false;
+                        return Handed::Part(any);
                     }
                     if link.send(piece.encode()).await.is_err() {
                         link.close();
-                        return false;
+                        return Handed::Failed;
                     }
+                    any = true;
                 }
-                true
+                Handed::Whole
             };
-            let sent = match crate::runtime::timeout(SEND_DEADLINE, sending).await {
-                Ok(sent) => sent,
+            let handed = match crate::runtime::timeout(SEND_DEADLINE, sending).await {
+                Ok(handed) => handed,
                 Err(_) => {
                     link.close();
-                    false
+                    Handed::Failed
                 }
             };
             drop(transfer);
-            if sent {
-                counters.served(record.len());
-                room_counters.served(record.len());
+            let draining = match handed {
+                Handed::Whole => {
+                    counters.served(record.len());
+                    room_counters.served(record.len());
+                    true
+                }
+                Handed::Part(any) => any,
+                Handed::Failed => false,
+            };
+            // A hidden page's timers are slowed, which would hold the place
+            // long after the channel emptied: there it goes once handed over.
+            if !draining || crate::runtime::page_hidden() {
+                return;
+            }
+            // The place is held until the channel holds nothing more, or the
+            // peer asks again, which means the record reached it: if it has
+            // asked again already, the place goes now.
+            let number = link.next_draining.fetch_add(1, Ordering::Relaxed);
+            if !link.hold_until_sent(number, asked, slot) {
+                return;
+            }
+            // A page hidden meanwhile lets the place go at once, as its timers
+            // slow down.
+            let drain = {
+                let waiting = std::pin::pin!(link.until_empty(number, started + SEND_DEADLINE));
+                let hidden = std::pin::pin!(crate::runtime::until_page_hidden());
+                match futures::future::select(waiting, hidden).await {
+                    futures::future::Either::Left((drain, _)) => drain,
+                    futures::future::Either::Right(_) => Drain::Ended,
+                }
+            };
+            link.drained(number);
+            if drain == Drain::Stalled {
+                // Bytes still not gone past the deadline, with nothing newer
+                // asked of the link: a peer that stopped reading, which ends
+                // the link as a send that stalls does (already stopped when
+                // the stall was found).
+                link.close();
             }
         });
     }
@@ -934,7 +1005,117 @@ impl Link {
     /// Sends one message in its turn.
     async fn send(&self, message: Vec<u8>) -> Result<(), super::rtc::RtcError> {
         let _turn = self.sending.lock().await;
-        self.sender.send(message).await
+        let bytes = u64::try_from(message.len()).unwrap_or(u64::MAX);
+        self.sender.send(message).await?;
+        self.handed.fetch_add(bytes, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn drains(&self) -> MutexGuard<'_, Drains> {
+        self.draining.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Counts the peer's new ask, and frees the places of the records the
+    /// link still drains: the peer has them. Returns the count.
+    fn asked_again(&self) -> u64 {
+        let (asked, freed) = {
+            let mut drains = self.drains();
+            drains.asked = drains.asked.wrapping_add(1);
+            (drains.asked, std::mem::take(&mut drains.records))
+        };
+        // Given back outside the lock.
+        drop(freed);
+        asked
+    }
+
+    /// Holds `slot` for the record `number`, sent for the peer's ask
+    /// `asked`, until its channel empties; unless the peer has asked again
+    /// since, which frees it now. Returns whether it is held.
+    fn hold_until_sent(&self, number: u64, asked: u64, slot: UploadSlot) -> bool {
+        let mut drains = self.drains();
+        if drains.asked != asked {
+            drop(drains);
+            drop(slot);
+            return false;
+        }
+        drains.records.push(Draining {
+            number,
+            _slot: slot,
+        });
+        true
+    }
+
+    /// Whether the draining record `number`, past its deadline, still holds
+    /// its place: if so the link stops, in the same step, so a peer asking
+    /// again at that moment either retires it first or finds the link
+    /// stopped.
+    fn stalled(&self, number: u64) -> Drain {
+        let mut drains = self.drains();
+        let Some(position) = drains
+            .records
+            .iter()
+            .position(|draining| draining.number == number)
+        else {
+            return Drain::Ended;
+        };
+        let claimed = drains.records.remove(position);
+        self.stop();
+        drop(drains);
+        drop(claimed);
+        Drain::Stalled
+    }
+
+    /// Frees the place of the draining record `number`, if it still holds
+    /// one.
+    fn drained(&self, number: u64) {
+        let freed: Vec<Draining> = {
+            let mut drains = self.drains();
+            let (freed, kept) = std::mem::take(&mut drains.records)
+                .into_iter()
+                .partition(|record| record.number == number);
+            drains.records = kept;
+            freed
+        };
+        // Given back outside the lock.
+        drop(freed);
+    }
+
+    /// Waits until the channel holds nothing unsent, while the draining
+    /// record `number` still holds its place: by `by`, or it stalled.
+    /// Natively a channel can have its later bytes acknowledged before
+    /// earlier ones are sent again, so only an empty channel tells that a
+    /// record has left it whole.
+    async fn until_empty(&self, number: u64, by: Instant) -> Drain {
+        loop {
+            let unsent = self.sender.unsent().await;
+            let now = Instant::now();
+            if self.is_closed() {
+                return Drain::Ended;
+            }
+            let held = self
+                .drains()
+                .records
+                .iter()
+                .any(|draining| draining.number == number);
+            // Its peer asked again: it has the record, and what the channel
+            // still holds is no longer this send's.
+            if !held || unsent == 0 {
+                return Drain::Ended;
+            }
+            if now > by {
+                return self.stalled(number);
+            }
+            crate::runtime::sleep(SENT_POLL.min(by.saturating_duration_since(now))).await;
+        }
+    }
+
+    /// Bytes that have left the channel (natively, that the peer has
+    /// acknowledged) since the last time this was asked.
+    pub(super) async fn sent_since(&self) -> u64 {
+        let handed = self.handed.load(Ordering::Acquire);
+        let unsent = u64::try_from(self.sender.unsent().await).unwrap_or(u64::MAX);
+        let left = handed.saturating_sub(unsent);
+        left.saturating_sub(self.counted.fetch_max(left, Ordering::AcqRel))
     }
 
     /// Sends queued messages until the link closes, gathering the addresses
@@ -981,6 +1162,26 @@ impl Link {
             }
         }
     }
+}
+
+/// How a record's place came to end.
+#[derive(Debug, PartialEq, Eq)]
+enum Drain {
+    /// Its channel emptied, its peer asked again, or the link closed.
+    Ended,
+    /// Its channel still held bytes past the send's deadline.
+    Stalled,
+}
+
+/// What became of a record's send.
+enum Handed {
+    /// Every piece went to the channel.
+    Whole,
+    /// The asker cancelled it partway, after some of its pieces went, or
+    /// before any did.
+    Part(bool),
+    /// The link failed, or the send ran out of time.
+    Failed,
 }
 
 /// A read waiting for a turn on a link, counted while it waits.

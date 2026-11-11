@@ -112,8 +112,8 @@ async fn a_close_group_read_counts_as_a_fetch_while_it_runs() {
     assert_eq!(client.swarm_fetches_running(), 0);
     let read = client.chunk_get_from_close_group(&address);
     tokio::pin!(read);
-    // Its lookup waits on the network: from its first step until it ends, the
-    // client sends other readers one record at a time.
+    // Its lookup waits on the network: from its first step until it ends, it
+    // counts as a fetch of the client's own.
     assert!(futures::poll!(read.as_mut()).is_pending());
     assert_eq!(client.swarm_fetches_running(), 1);
     let results = read.await.expect("close-group read");

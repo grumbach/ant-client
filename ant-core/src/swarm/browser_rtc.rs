@@ -229,6 +229,13 @@ impl ChannelSender for Connection {
         })
     }
 
+    fn unsent(&self) -> BoxFuture<'_, usize> {
+        let unsent = self.channel.borrow().as_ref().map_or(0, |channel| {
+            usize::try_from(channel.buffered_amount()).unwrap_or(usize::MAX)
+        });
+        Box::pin(async move { unsent })
+    }
+
     fn close(&self) {
         if let Some(channel) = self.channel.borrow().as_ref() {
             channel.close();

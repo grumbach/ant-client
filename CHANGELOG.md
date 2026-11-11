@@ -27,17 +27,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WebRTC (webrtc-rs natively, the browser's own in WASM), and takes records they hold beside the
   nodes, never instead of them: a peer keeps a read while it is on pace to finish within about
   as long as the nodes take now, then the nodes are read too, and the first record that checks
-  against its address wins. Finding peers runs on its own and never delays a read, and a
-  client sends other readers one record at a time while its own fetches run (another number,
-  from 0 to 4, with `ANT_SWARM_UPLOADS_WHILE_READING` natively or `setSwarmUploadsWhileReading`
-  in the browser); nodes stay the last seed, and nodes without swarm rooms are read as before. A
-  record a client drops from its store to make room is taken back from the readers it was
-  announced to, so they stop asking it for that record. Each client asks for a file's records
+  against its address wins. Finding peers runs on its own and never delays a read. A client
+  sends other readers as many records at once as its upload rate gives each the rate a reader
+  needs, the way a BitTorrent client sizes its upload slots: one at first, and one more for each
+  1 MiB/s (twice the 512 KiB/s below which a reader gives up on a peer) its sends have shown they
+  deliver, up to one a link. Its rate is what its line carried: the bytes that left all its
+  links' channels (natively, that the readers acknowledged), counted every 100 ms while any send
+  holds a place, over the whole of each tick in which any did or bytes left, so it never counts
+  bytes without their time; the best rate seen is kept, fading a fifth for every 4 s of sending,
+  so readers asking little or reading slowly do not make it forget its line, and after every 8 s
+  of sending, one more place for 2 s tries whether the line carries more. A send holds its place
+  until its channel is empty, or its reader asks again, or the page is hidden (a hidden page's
+  timers are slowed). Nodes stay the last seed, and nodes
+  without swarm rooms are read as before. A record a client drops from its store to make room is
+  taken back from the readers it was announced to, so they stop asking it for that record. Each client asks for a file's records
   in an order of its own, the same for each of its downloads; a native download, which writes
   the file in order, takes that order within each decrypt batch. Always on. In `ant-core`: `Client::join_swarm`,
   `swarm_stats` and `swarm_room_stats`, with `SwarmStats` (its `discovery` field a
-  `DiscoveryStats`; it also counts the reads that asked no peer and why, `reads_*`, and the asks
-  this client refused and why, `refused_*`) and `RoomStats` (each open link's `OpenLinkPeer` names the peer it reaches,
+  `DiscoveryStats`; it also counts the reads that asked no peer and why, `reads_*`, the asks
+  this client refused and why, `refused_*`, and how many records it sends at once now,
+  `uploads_at_once`) and `RoomStats` (each open link's `OpenLinkPeer` names the peer it reaches,
   for that room only). In the browser: `joinSwarm` (whose optional `{ signal }` cancels a join
   that has not joined yet), `swarmStats` and `swarmRoomStats`; `openPublicFile` and
   `openPrivateFile` take a `signal` too, as does `readRange` (`{ signal }`), and a download,

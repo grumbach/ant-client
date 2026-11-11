@@ -154,6 +154,20 @@ impl ChannelSender for NativeSender {
         })
     }
 
+    fn unsent(&self) -> BoxFuture<'_, usize> {
+        Box::pin(async move {
+            let channel = self
+                .channel
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            match channel {
+                Some(channel) => channel.buffered_amount().await,
+                None => 0,
+            }
+        })
+    }
+
     fn close(&self) {
         // Closing awaits the stack, which needs a runtime; at exit there may
         // be none, and the process ends the connection anyway.

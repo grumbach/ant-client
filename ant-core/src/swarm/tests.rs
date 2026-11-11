@@ -57,6 +57,16 @@ fn record(seed: u8, len: usize) -> (XorName, Bytes) {
     (ant_protocol::compute_address(&content), content)
 }
 
+/// Has `swarm` take its sends to have shown a rate that lets it send
+/// `at_least` records at once.
+fn sends_at_pace(swarm: &Swarm, at_least: usize) {
+    swarm
+        .inner
+        .upload_limit
+        .set_best_rate(at_least as f64 * 1024.0 * 1024.0);
+    assert!(swarm.inner.upload_limit.current() >= at_least);
+}
+
 async fn eventually(what: &str, check: impl Fn() -> bool) {
     for _ in 0..200 {
         if check() {
@@ -268,6 +278,7 @@ async fn a_record_nobody_announced_is_left_to_the_nodes() {
             reads_not_offered: 1,
             links: 1,
             rooms: 1,
+            uploads_at_once: 1,
             discovery: DiscoveryStats {
                 channels_opened: 1,
                 links_proven: 1,
@@ -880,6 +891,8 @@ async fn a_peer_sends_only_so_many_records_at_once() {
     for (address, content) in &records {
         alice.seed(*address, content.clone());
     }
+    // A client whose sends have kept their pace sends as many as it may.
+    sends_at_pace(&alice, MAX_UPLOADS);
     // Ask for every record at once, reading nothing until all are asked.
     for (id, (address, _)) in (0u32..).zip(&records) {
         send(
@@ -911,17 +924,13 @@ async fn a_peer_sends_only_so_many_records_at_once() {
     // being sent as one may.
     let stats = alice.stats();
     assert_eq!(
-        (
-            stats.refused_busy_link,
-            stats.refused_busy_reading,
-            stats.refused_busy_uploads
-        ),
-        (4, 0, 0)
+        (stats.refused_busy_link, stats.refused_busy_uploads),
+        (4, 0)
     );
 }
 
 #[tokio::test]
-async fn a_peer_still_reading_sends_one_record_at_a_time() {
+async fn a_client_sends_one_record_at_a_time_until_its_sends_show_their_pace() {
     let rtc = SharedMemoryRtc::default();
     let alice = client(&rtc);
     let mut asker = hand_driven(&rtc, &alice).await;
@@ -933,8 +942,7 @@ async fn a_peer_still_reading_sends_one_record_at_a_time() {
     for (address, content) in &records {
         alice.seed(*address, content.clone());
     }
-    // A read of Alice's own runs: her download keeps her CPU and line.
-    let reading = alice.fetching(&[0; 32], true);
+    // Alice has sent nothing yet: she does not know her line's pace.
     for (id, (address, _)) in (0u32..).zip(&records) {
         send(
             &asker,
@@ -960,9 +968,9 @@ async fn a_peer_still_reading_sends_one_record_at_a_time() {
         }
     }
     assert_eq!((finished, busy), (1, 2));
-    assert_eq!(alice.stats().refused_busy_reading, 2);
-    // Done reading, she sends as many as any peer does.
-    drop(reading);
+    assert_eq!(alice.stats().refused_busy_uploads, 2);
+    // Once her sends have kept their pace, more at once.
+    sends_at_pace(&alice, MAX_UPLOADS);
     for (id, (address, _)) in (10u32..).zip(&records) {
         send(
             &asker,
@@ -987,16 +995,16 @@ async fn a_peer_still_reading_sends_one_record_at_a_time() {
         }
     }
     assert_eq!((finished, busy), (2, 1));
-    // Past the link's own limit now, not the one for reading.
+    // Past the link's own limit now, not her sends' pace.
     let stats = alice.stats();
     assert_eq!(
-        (stats.refused_busy_reading, stats.refused_busy_link),
+        (stats.refused_busy_uploads, stats.refused_busy_link),
         (2, 1)
     );
 }
 
 #[tokio::test]
-async fn a_peer_still_reading_sends_one_record_at_a_time_across_its_links() {
+async fn a_client_new_to_sending_sends_one_record_at_a_time_across_its_links() {
     let rtc = SharedMemoryRtc::default();
     let alice = client(&rtc);
     let room = joined(&alice);
@@ -1014,7 +1022,6 @@ async fn a_peer_still_reading_sends_one_record_at_a_time_across_its_links() {
     for (address, content) in &records {
         alice.seed(*address, content.clone());
     }
-    let _reading = alice.fetching(&[0; 32], true);
     // One ask on each link, at once.
     for (peer, (address, _)) in [&first, &second].into_iter().zip(&records) {
         send(
@@ -1166,6 +1173,8 @@ async fn two_records_sent_at_once_share_the_channel() {
     let rtc = SharedMemoryRtc::default();
     let alice = client(&rtc);
     let mut asker = hand_driven(&rtc, &alice).await;
+    // Sends that have kept their pace: two at once are let through.
+    sends_at_pace(&alice, MAX_UPLOADS);
     // A channel that never makes a send wait, as a browser's often does.
     let records: Vec<_> = (0..2)
         .map(|seed| record(seed, 32 * wire::FRAME_BYTES))
@@ -1528,6 +1537,9 @@ async fn an_ask_cancelled_and_made_again_sends_only_the_new_record() {
     let rtc = SharedMemoryRtc::default();
     let alice = client(&rtc);
     let mut asker = hand_driven(&rtc, &alice).await;
+    // Sends that have kept their pace: the old transfer, still stopping,
+    // leaves room for the new one.
+    sends_at_pace(&alice, MAX_UPLOADS);
     let (first, first_content) = record(1, 5 * wire::FRAME_BYTES);
     let (second, second_content) = record(2, 3 * wire::FRAME_BYTES + 10);
     knows(&[&alice], &[first, second]);
@@ -2003,7 +2015,7 @@ async fn a_read_counts_its_rooms_as_read_while_it_runs() {
 }
 
 #[tokio::test]
-async fn every_fetch_holds_sends_to_one_but_only_a_files_read_holds_its_room() {
+async fn only_a_files_read_holds_its_room() {
     let rtc = SharedMemoryRtc::default();
     let alice = client(&rtc);
     let (address, _) = record(4, 100);
@@ -2011,32 +2023,14 @@ async fn every_fetch_holds_sends_to_one_but_only_a_files_read_holds_its_room() {
     let room = joined(&alice);
     let later = || crate::runtime::Clock::now() + ROOM_TURNOVER * 2;
     // A fetch that shares nothing (a file's map, a raw read, an existence
-    // check): one send at a time while it runs, and no room counts as read.
+    // check): no room counts as read while it runs.
     let fetch = alice.fetching(&address, false);
-    let first = alice.inner.start_upload();
-    assert!(first.is_ok());
-    assert!(matches!(
-        alice.inner.start_upload(),
-        Err(UploadsTaken::WhileReading)
-    ));
     assert!(room.unread_for(later()) >= ROOM_TURNOVER);
     assert!(alice.inner.active_reads().is_empty());
-    drop(first);
     drop(fetch);
-    // Nothing fetched: as many sends as any client makes.
-    let sends: Vec<_> = (0..MAX_UPLOADS)
-        .filter_map(|_| alice.inner.start_upload().ok())
-        .collect();
-    assert_eq!(sends.len(), MAX_UPLOADS);
-    assert!(matches!(alice.inner.start_upload(), Err(UploadsTaken::All)));
-    drop(sends);
-    // A read of the file's data record holds its room as well.
+    // A read of the file's data record holds its room.
     let read = alice.fetching(&address, true);
     assert_eq!(room.unread_for(later()), Duration::ZERO);
-    let first = alice.inner.start_upload();
-    assert!(first.is_ok());
-    assert!(alice.inner.start_upload().is_err());
-    drop(first);
     drop(read);
     assert!(room.unread_for(later()) >= ROOM_TURNOVER);
 }
@@ -2557,48 +2551,6 @@ async fn a_record_a_peer_says_is_gone_is_not_asked_of_it() {
 }
 
 #[tokio::test]
-async fn a_peer_still_reading_sends_as_many_records_at_once_as_it_is_set_to() {
-    let rtc = SharedMemoryRtc::default();
-    let alice = client(&rtc);
-    let (address, _) = record(4, 100);
-    knows(&[&alice], &[address]);
-    let _reading = alice.fetching(&address, true);
-    alice.set_uploads_while_reading(3);
-    let sends: Vec<_> = (0..3)
-        .filter_map(|_| alice.inner.start_upload().ok())
-        .collect();
-    assert_eq!(sends.len(), 3);
-    assert!(matches!(
-        alice.inner.start_upload(),
-        Err(UploadsTaken::WhileReading)
-    ));
-    drop(sends);
-    // None at all while reading.
-    alice.set_uploads_while_reading(0);
-    assert!(matches!(
-        alice.inner.start_upload(),
-        Err(UploadsTaken::WhileReading)
-    ));
-    // Never more than any client sends.
-    alice.set_uploads_while_reading(99);
-    let sends: Vec<_> = (0..MAX_UPLOADS)
-        .filter_map(|_| alice.inner.start_upload().ok())
-        .collect();
-    assert_eq!(sends.len(), MAX_UPLOADS);
-    assert!(matches!(alice.inner.start_upload(), Err(UploadsTaken::All)));
-}
-
-#[test]
-fn the_uploads_while_reading_setting_is_a_number_of_records() {
-    assert_eq!(uploads_while_reading("4"), Some(4));
-    assert_eq!(uploads_while_reading(" 2\n"), Some(2));
-    assert_eq!(uploads_while_reading("0"), Some(0));
-    for not_a_number in ["", "four", "-1", "1.5"] {
-        assert_eq!(uploads_while_reading(not_a_number), None);
-    }
-}
-
-#[tokio::test]
 async fn a_record_dropped_and_kept_again_is_offered_again() {
     const LEN: usize = 8_000;
     let rtc = SharedMemoryRtc::default();
@@ -2767,4 +2719,194 @@ async fn a_record_taken_back_while_its_read_waits_is_not_asked_for() {
     assert!(!asked_again);
     let stats = bob.stats();
     assert_eq!((stats.asks_missing, stats.reads_not_offered), (0, 1));
+}
+
+#[test]
+fn a_client_sends_one_record_at_a_time_at_first_and_up_to_one_a_link() {
+    let alice = Swarm::with_rtc(None, 0);
+    let first = alice.inner.start_upload();
+    assert!(first.is_some());
+    assert!(alice.inner.start_upload().is_none());
+    drop(first);
+    sends_at_pace(&alice, MAX_UPLOADS);
+    assert_eq!(MAX_UPLOADS, MAX_LINKS);
+    assert_eq!(alice.stats().uploads_at_once, 16);
+    let sends: Vec<_> = (0..MAX_UPLOADS)
+        .filter_map(|_| alice.inner.start_upload())
+        .collect();
+    assert_eq!(sends.len(), MAX_UPLOADS);
+    assert!(alice.inner.start_upload().is_none());
+}
+
+/// Reads every piece of the record asked under `id` from the hand-driven
+/// end, up to its last.
+async fn whole_record(peer: &mut Channel, id: u32) {
+    loop {
+        if let Message::Piece {
+            id: piece_id,
+            total,
+            offset,
+            data,
+        } = next_message(peer).await
+        {
+            if piece_id == id && offset as usize + data.len() == total as usize {
+                return;
+            }
+        }
+    }
+}
+
+/// The next `Busy` or last piece the hand-driven end receives.
+async fn busy_or_sent(peer: &mut Channel) -> &'static str {
+    loop {
+        match next_message(peer).await {
+            Message::Busy { .. } => return "busy",
+            Message::Piece {
+                total,
+                offset,
+                data,
+                ..
+            } if offset as usize + data.len() == total as usize => return "sent",
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_send_keeps_its_place_until_its_bytes_leave_the_channel_or_its_peer_asks_again() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let room = joined(&alice);
+    let mut first = hand_driven_in(&rtc, &alice, &room).await;
+    let mut second = unproven(&rtc, &alice, &room).await;
+    send(&second, hello_from(4)).await;
+    send(&second, proof_from(4, &room.secret, &[1; 16], true)).await;
+    eventually("both links open", || alice.stats().links == 2).await;
+    let records: Vec<_> = (0..3)
+        .map(|seed| record(seed, 3 * wire::FRAME_BYTES))
+        .collect();
+    let addresses: Vec<XorName> = records.iter().map(|(address, _)| *address).collect();
+    knows(&[&alice], &addresses);
+    for (address, content) in &records {
+        alice.seed(*address, content.clone());
+    }
+    let &[one, two, three] = addresses.as_slice() else {
+        panic!("three records");
+    };
+    // The channels take what they are given and pass nothing on yet.
+    rtc.0.unsent.store(usize::MAX, Ordering::Release);
+    send(
+        &first,
+        Message::Get {
+            id: 0,
+            address: one,
+        },
+    )
+    .await;
+    whole_record(&mut first, 0).await;
+    // Handed over whole, its bytes still in the channel: it keeps its place.
+    send(
+        &second,
+        Message::Get {
+            id: 0,
+            address: two,
+        },
+    )
+    .await;
+    assert_eq!(busy_or_sent(&mut second).await, "busy");
+    assert_eq!(alice.inner.upload_limit.running(), 1);
+    // Its own peer asking again has had it: the place goes to the new ask.
+    send(
+        &first,
+        Message::Get {
+            id: 1,
+            address: three,
+        },
+    )
+    .await;
+    assert_eq!(busy_or_sent(&mut first).await, "sent");
+    // Once the channel passes the bytes on, no place is held.
+    rtc.0.unsent.store(0, Ordering::Release);
+    eventually("the last send gives its place back", || {
+        alice.inner.upload_limit.running() == 0
+    })
+    .await;
+    assert_eq!(alice.stats().refused_busy_uploads, 1);
+}
+
+#[tokio::test]
+async fn a_link_counts_what_left_its_channel_once() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let mut peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    let link = alice.inner.links().first().cloned();
+    let link = link.unwrap_or_else(|| panic!("no link"));
+    // Its name and proof went, and left the channel.
+    assert!(link.sent_since().await > 0);
+    assert_eq!(link.sent_since().await, 0);
+    // A `Have` goes, its last 10 bytes still in the channel.
+    rtc.0.unsent.store(10, Ordering::Release);
+    let (address, content) = record(1, 100);
+    knows(&[&alice], &[address]);
+    alice.seed(address, content);
+    assert_eq!(
+        next_offer(&mut peer).await,
+        Message::Have {
+            addresses: vec![address]
+        }
+    );
+    let have = Message::Have {
+        addresses: vec![address],
+    }
+    .encode()
+    .len() as u64;
+    assert_eq!(link.sent_since().await, have - 10);
+    // Once they leave, those 10, and never again.
+    rtc.0.unsent.store(0, Ordering::Release);
+    assert_eq!(link.sent_since().await, 10);
+    assert_eq!(link.sent_since().await, 0);
+}
+
+#[tokio::test]
+async fn a_send_its_peer_cancelled_and_asked_past_holds_no_place() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let mut peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    sends_at_pace(&alice, 2);
+    let (long, long_content) = record(1, 48 * wire::FRAME_BYTES);
+    let (short, short_content) = record(2, 2 * wire::FRAME_BYTES);
+    knows(&[&alice], &[long, short]);
+    alice.seed(long, long_content);
+    alice.seed(short, short_content);
+    // Nothing the channel takes leaves it.
+    rtc.0.unsent.store(usize::MAX, Ordering::Release);
+    // The long one asked, given up on and the short one asked, at once: the
+    // long one's send ends after the short one's ask, or before it.
+    send(
+        &peer,
+        Message::Get {
+            id: 0,
+            address: long,
+        },
+    )
+    .await;
+    send(&peer, Message::Cancel { id: 0 }).await;
+    send(
+        &peer,
+        Message::Get {
+            id: 1,
+            address: short,
+        },
+    )
+    .await;
+    whole_record(&mut peer, 1).await;
+    // Only the short one's place is held, waiting for its channel.
+    eventually("the long one holds no place", || {
+        alice.inner.upload_limit.running() == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(alice.inner.upload_limit.running(), 1);
 }

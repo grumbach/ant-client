@@ -971,8 +971,8 @@ impl Client {
         self.swarm.stats()
     }
 
-    /// How many of this client's own fetches from the nodes run now: while
-    /// any does, it sends other readers one record at a time. For tests.
+    /// How many of this client's own fetches from the nodes run now. For
+    /// tests.
     #[cfg(feature = "test-utils")]
     #[must_use]
     pub fn swarm_fetches_running(&self) -> usize {

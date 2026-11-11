@@ -2896,16 +2896,6 @@ impl BrowserNetworkClient {
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Sets how many records this client sends other readers at once while
-    /// downloads of its own run: from 0 to 4 (more is taken as 4), and 1
-    /// until set. A client not reading sends 4. Sends already running finish.
-    #[wasm_bindgen(js_name = setSwarmUploadsWhileReading)]
-    pub fn set_swarm_uploads_while_reading(&self, uploads: u32) {
-        self.shared
-            .swarm()
-            .set_uploads_while_reading(usize::try_from(uploads).unwrap_or(usize::MAX));
-    }
-
     /// The same, for each room this client is in now: `{ tag, ... }` per
     /// room, one room per file read lately. A read reports its file's room as
     /// `Swarm room <tag>` once it resolves the file, and every link of the

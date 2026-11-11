@@ -40,6 +40,7 @@ mod native_rtc;
 mod room;
 pub(crate) mod rtc;
 mod store;
+mod uploads;
 mod wire;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -58,8 +59,6 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, Semaphore};
-#[cfg(feature = "native")]
-use tracing::warn;
 
 use crate::client_engine::files::MIN_FILE_CHUNKS;
 use crate::data::{DataMap, Network, XorName};
@@ -71,6 +70,7 @@ use room::Room;
 use rtc::{Channel, Rtc};
 use self_encryption::DataMapIndex;
 use store::RecordStore;
+use uploads::{UploadLimit, UploadSlot};
 
 /// Bytes of records a client keeps to serve to other clients.
 #[cfg(feature = "native")]
@@ -93,19 +93,10 @@ const MAX_WAITING_JOINS: usize = 2;
 const MAX_LINKS_PER_ROOM: usize = 8;
 /// Links a client keeps in all.
 const MAX_LINKS: usize = 16;
-/// Records a client sends to other clients at once.
-const MAX_UPLOADS: usize = 4;
-/// Records a client sends at once while fetches of its own are running: a
-/// record sent costs the sender's CPU and line, which its own download needs
-/// first. A client done fetching sends [`MAX_UPLOADS`]. A native client takes
-/// another number from [`UPLOADS_WHILE_READING_ENV`], a browser page from
-/// `setSwarmUploadsWhileReading` (see [`Swarm::set_uploads_while_reading`]).
-const UPLOADS_WHILE_READING: usize = 1;
-/// The environment variable a native client's swarm reads when it starts:
-/// the records it sends at once while fetches of its own run, from 0 to
-/// [`MAX_UPLOADS`], in place of [`UPLOADS_WHILE_READING`].
-#[cfg(feature = "native")]
-pub(crate) const UPLOADS_WHILE_READING_ENV: &str = "ANT_SWARM_UPLOADS_WHILE_READING";
+/// The most records a client sends to other clients at once: one a link, as
+/// a peer asks a link for one record at a time. How many it does send at
+/// once follows its upload rate (see [`uploads`]).
+const MAX_UPLOADS: usize = MAX_LINKS;
 /// Offers a client answers at once, each until the node has taken its answer.
 const MAX_ANSWERS: usize = 8;
 /// Records a client takes from other clients at once; reads past this go to
@@ -160,12 +151,7 @@ pub struct SwarmStats {
     /// many records as one link may have at once.
     pub refused_busy_link: u64,
     /// Asks it answered `Busy` because it was sending as many records as it
-    /// does while fetches of its own run: 1, unless
-    /// `ANT_SWARM_UPLOADS_WHILE_READING` (natively) or
-    /// `setSwarmUploadsWhileReading` (in a browser) set another number.
-    pub refused_busy_reading: u64,
-    /// Asks it answered `Busy` because it was sending as many records as it
-    /// ever does at once.
+    /// sends at once now (see `uploads_at_once`).
     pub refused_busy_uploads: u64,
     /// Records this client sent to other clients.
     pub records_served: u64,
@@ -175,6 +161,11 @@ pub struct SwarmStats {
     pub links: u64,
     /// Rooms this client is in now.
     pub rooms: u64,
+    /// Records this client sends other clients at once now: one at first,
+    /// and one more for each 1 MiB a second its sends have shown they
+    /// deliver (twice the slowest a peer takes a record at), up to one a
+    /// link.
+    pub uploads_at_once: u64,
     /// What finding and linking other clients took.
     pub discovery: DiscoveryStats,
 }
@@ -341,25 +332,6 @@ impl Pace {
     }
 }
 
-/// A record being sent to another client, counted until the send ends (see
-/// [`Inner::start_upload`]).
-pub(crate) struct Upload(Arc<AtomicUsize>);
-
-/// Why [`Inner::start_upload`] had no place for another send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UploadsTaken {
-    /// As many as this client sends while fetches of its own run.
-    WhileReading,
-    /// [`MAX_UPLOADS`].
-    All,
-}
-
-impl Drop for Upload {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// A fetch of this client's, counted while it runs (see
 /// [`Swarm::fetching`]).
 pub(crate) struct Reading {
@@ -398,7 +370,6 @@ pub(crate) struct Counters {
     reads_hidden: AtomicU64,
     refused_missing: AtomicU64,
     refused_busy_link: AtomicU64,
-    refused_busy_reading: AtomicU64,
     refused_busy_uploads: AtomicU64,
     records_served: AtomicU64,
     bytes_served: AtomicU64,
@@ -592,6 +563,61 @@ pub(crate) fn spawn<F: Future<Output = ()> + 'static>(task: F) -> bool {
     false
 }
 
+/// Counts the bytes that leave the links of `swarm` every
+/// [`uploads::SAMPLE_EVERY`] and gives them to its upload limit, while any
+/// send holds a place: with the whole of a tick in which bytes left or a
+/// send held a place as time spent sending, so bytes never count without
+/// their time. Bytes that left before it began (sends that finished while
+/// nothing was counted) are not counted.
+async fn count_sent(swarm: Weak<Inner>) {
+    let mut primed = false;
+    let mut ticked = web_time::Instant::now();
+    let mut held = std::time::Duration::ZERO;
+    loop {
+        if primed {
+            crate::runtime::sleep(uploads::SAMPLE_EVERY).await;
+        }
+        let Some(inner) = swarm.upgrade() else {
+            return;
+        };
+        // One lock at a time: the links, then those let go, alone.
+        let mut links: Vec<Arc<Link>> = inner.links().iter().cloned().collect();
+        links.extend(std::mem::take(
+            &mut *inner.let_go.lock().unwrap_or_else(PoisonError::into_inner),
+        ));
+        let mut sent: u64 = 0;
+        for link in &links {
+            sent = sent.saturating_add(link.sent_since().await);
+        }
+        let now = web_time::Instant::now();
+        let held_now = inner.upload_limit.held();
+        if primed {
+            let sending = sent > 0 || held_now > held || inner.upload_limit.running() > 0;
+            let time = if sending {
+                now.saturating_duration_since(ticked)
+            } else {
+                std::time::Duration::ZERO
+            };
+            inner.upload_limit.sampled(sent, time);
+        }
+        ticked = now;
+        held = held_now;
+        primed = true;
+        if inner.stop.is_stopped() || inner.upload_limit.running() == 0 {
+            inner.counting_sent.store(false, Ordering::Release);
+            // A send that took a place meanwhile, seeing this still run,
+            // started none: start again for it.
+            if inner.stop.is_stopped()
+                || inner.upload_limit.running() == 0
+                || inner.counting_sent.swap(true, Ordering::AcqRel)
+            {
+                return;
+            }
+            primed = false;
+        }
+    }
+}
+
 /// The room every client reading the file `data_map` describes meets in, and
 /// the room's secret. The room is the address this root map has when stored
 /// as a public record: a public file's own address when the file was
@@ -764,11 +790,14 @@ pub(crate) struct Inner {
     /// Held while the store changes and the links are told of it, and while a
     /// new link is told what the store holds (see [`Inner::publishing`]).
     publishing: Mutex<()>,
-    /// Records being sent to other clients now.
-    uploads: Arc<AtomicUsize>,
-    /// How many may be while fetches of this client's own run: at most
-    /// [`MAX_UPLOADS`].
-    uploads_while_reading: AtomicUsize,
+    /// The places for sending records to other clients at once (see
+    /// [`uploads`]).
+    upload_limit: Arc<UploadLimit>,
+    /// Whether the task counting what the links send runs (see
+    /// [`count_sent`]).
+    counting_sent: AtomicBool,
+    /// Links let go while it runs, whose last bytes it has still to count.
+    let_go: Mutex<Vec<Arc<Link>>>,
     /// This client's own fetches running now (see [`Swarm::fetching`]).
     reading: Arc<AtomicUsize>,
     /// The records those reads are reading, and how many reads each: a room
@@ -800,25 +829,8 @@ pub(crate) struct Inner {
 
 impl Default for Swarm {
     fn default() -> Self {
-        let swarm = Self::with_rtc(rtc::platform(), STORE_BYTES);
-        #[cfg(feature = "native")]
-        if let Ok(value) = std::env::var(UPLOADS_WHILE_READING_ENV) {
-            match uploads_while_reading(&value) {
-                Some(uploads) => swarm.set_uploads_while_reading(uploads),
-                None => warn!(
-                    "{UPLOADS_WHILE_READING_ENV}={value:?} is not a number of records; \
-                     sending {UPLOADS_WHILE_READING} at once while reading"
-                ),
-            }
-        }
-        swarm
+        Self::with_rtc(rtc::platform(), STORE_BYTES)
     }
-}
-
-/// The number [`UPLOADS_WHILE_READING_ENV`] is set to, if it is one.
-#[cfg(any(test, feature = "native"))]
-fn uploads_while_reading(value: &str) -> Option<usize> {
-    value.trim().parse().ok()
 }
 
 /// The swarms of this process, by the native node identity they speak as.
@@ -863,8 +875,9 @@ impl Swarm {
                 rooms: Mutex::default(),
                 leaving: Arc::new(Semaphore::new(MAX_LEAVING)),
                 publishing: Mutex::default(),
-                uploads: Arc::default(),
-                uploads_while_reading: AtomicUsize::new(UPLOADS_WHILE_READING),
+                upload_limit: Arc::new(UploadLimit::new(MAX_UPLOADS)),
+                counting_sent: AtomicBool::new(false),
+                let_go: Mutex::default(),
                 reading: Arc::default(),
                 active_reads: Mutex::default(),
                 answers: Arc::new(Semaphore::new(MAX_ANSWERS)),
@@ -914,24 +927,6 @@ impl Swarm {
             }
         }
         places
-    }
-
-    /// Sets how many records this client sends other clients at once while
-    /// fetches of its own run: from 0 to [`MAX_UPLOADS`] (more is taken as
-    /// [`MAX_UPLOADS`]), [`UPLOADS_WHILE_READING`] until set. Sends already
-    /// running finish.
-    #[cfg_attr(
-        not(any(
-            test,
-            feature = "native",
-            all(feature = "browser-wasm", target_arch = "wasm32")
-        )),
-        allow(dead_code)
-    )]
-    pub(crate) fn set_uploads_while_reading(&self, uploads: usize) {
-        self.inner
-            .uploads_while_reading
-            .store(uploads.min(MAX_UPLOADS), Ordering::Relaxed);
     }
 
     /// Joins the room for a file being read, if not in it already, through
@@ -1437,13 +1432,11 @@ impl Swarm {
     }
 
     /// Counts a fetch of `address` by this client as running until the guard
-    /// goes. While any fetch of this client's runs, whatever it is for (a
-    /// file's records or its map, a raw or close-group read, or an existence
-    /// check), it sends other clients one record at a time: its own fetch
-    /// needs its CPU and line first. With `shares`, a read of a file's data
-    /// record, a room whose file holds `address` also counts as read the
-    /// whole time, so a read waiting at busy nodes never loses its room to
-    /// another file's (see [`room_to_leave`]).
+    /// goes, whatever it is for (a file's records or its map, a raw or
+    /// close-group read, or an existence check). With `shares`, a read of a
+    /// file's data record, a room whose file holds `address` also counts as
+    /// read the whole time, so a read waiting at busy nodes never loses its
+    /// room to another file's (see [`room_to_leave`]).
     pub(crate) fn fetching(&self, address: &XorName, shares: bool) -> Reading {
         self.inner.reading.fetch_add(1, Ordering::AcqRel);
         let room = shares.then(|| {
@@ -1575,12 +1568,12 @@ impl Swarm {
             reads_hidden: load(&counters.reads_hidden),
             refused_missing: load(&counters.refused_missing),
             refused_busy_link: load(&counters.refused_busy_link),
-            refused_busy_reading: load(&counters.refused_busy_reading),
             refused_busy_uploads: load(&counters.refused_busy_uploads),
             records_served: load(&counters.records_served),
             bytes_served: load(&counters.bytes_served),
             links,
             rooms,
+            uploads_at_once: self.inner.upload_limit.current() as u64,
             discovery: self.inner.discovery.snapshot(),
         }
     }
@@ -1635,28 +1628,20 @@ impl Swarm {
 }
 
 impl Inner {
-    /// A place to send a record now, or why not: [`MAX_UPLOADS`] at once,
-    /// and fewer while fetches of this client's own run
-    /// ([`UPLOADS_WHILE_READING`] unless set otherwise), taken in one step so
-    /// two links never both take the last. Sends already running when a read
-    /// starts finish.
-    fn start_upload(&self) -> Result<Upload, UploadsTaken> {
-        let limit = if self.reading.load(Ordering::Acquire) > 0 {
-            self.uploads_while_reading.load(Ordering::Relaxed)
-        } else {
-            MAX_UPLOADS
-        };
-        update_usize(&self.uploads, |running| {
-            (running < limit).then_some(running + 1)
-        })
-        .map_err(|running| {
-            if running < MAX_UPLOADS {
-                UploadsTaken::WhileReading
-            } else {
-                UploadsTaken::All
-            }
-        })?;
-        Ok(Upload(Arc::clone(&self.uploads)))
+    /// A place to send a record now, or `None`: as many at once as the
+    /// client's upload rate allows (see [`uploads`]), taken in one step so
+    /// two links never both take the last, and held until the channel the
+    /// record went to is empty or its peer asks again. Sends already running
+    /// when the limit falls finish. The swarm counts what its links send
+    /// while any send holds a place.
+    fn start_upload(self: &Arc<Self>) -> Option<UploadSlot> {
+        let slot = self.upload_limit.try_start()?;
+        if !self.counting_sent.swap(true, Ordering::AcqRel)
+            && !spawn(count_sent(Arc::downgrade(self)))
+        {
+            self.counting_sent.store(false, Ordering::Release);
+        }
+        Some(slot)
     }
 
     /// `addresses` grouped by the rooms this client is in whose file holds
@@ -1908,7 +1893,21 @@ impl Inner {
     }
 
     fn remove_link(&self, id: u64) {
-        self.links().retain(|link| link.id != id);
+        let removed: Vec<Arc<Link>> = {
+            let mut links = self.links();
+            let (removed, kept) = std::mem::take(&mut *links)
+                .into_iter()
+                .partition(|link| link.id == id);
+            *links = kept;
+            removed
+        };
+        // What a link let go of sent since it was last counted still counts.
+        if self.counting_sent.load(Ordering::Acquire) {
+            self.let_go
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(removed);
+        }
     }
 
     /// Two links between the same pair of clients in one room (met through

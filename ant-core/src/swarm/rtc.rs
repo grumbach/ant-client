@@ -84,6 +84,11 @@ pub(crate) trait ChannelSender: MaybeSend {
     /// Sends one message, first waiting while the channel holds more than
     /// [`MAX_BUFFERED_BYTES`] unsent.
     fn send(&self, message: Vec<u8>) -> BoxFuture<'_, Result<(), RtcError>>;
+    /// Bytes of the messages sent that the channel still holds: in a
+    /// browser, those it has not passed on to the network yet; natively
+    /// (webrtc-rs), those the peer has not acknowledged yet, a round trip
+    /// later.
+    fn unsent(&self) -> BoxFuture<'_, usize>;
     /// Closes the channel and its connection.
     fn close(&self);
 }
@@ -212,7 +217,7 @@ mod tests {
 pub(crate) mod memory {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     type Ends = (EventSink, mpsc::Receiver<ChannelEvent>);
     /// Where the other end's sink goes once it answers.
@@ -229,9 +234,13 @@ pub(crate) mod memory {
         /// Whether answerers learn their channel opened only after the
         /// offerer's first message, as webrtc-rs may report it.
         pub(crate) open_late: AtomicBool,
+        /// The bytes every channel says it holds unsent: none, unless a test
+        /// says otherwise (the channels pass messages on at once).
+        pub(crate) unsent: AtomicUsize,
     }
 
     struct MemorySender {
+        rtc: Arc<MemoryRtc>,
         peer: PeerSlot,
         own: EventSink,
         /// An `Open` the peer is still owed, given after this end's first
@@ -259,6 +268,11 @@ pub(crate) mod memory {
                     Err(RtcError::new("closed"))
                 }
             })
+        }
+
+        fn unsent(&self) -> BoxFuture<'_, usize> {
+            let unsent = self.rtc.unsent.load(Ordering::Acquire);
+            Box::pin(async move { unsent })
         }
 
         fn close(&self) {
@@ -308,6 +322,7 @@ pub(crate) mod memory {
                 }
                 Ok(Channel {
                     sender: Box::new(MemorySender {
+                        rtc,
                         peer,
                         own: sink,
                         open_after: AtomicBool::new(open_late),
@@ -381,6 +396,7 @@ pub(crate) mod memory {
                 *offer_peer.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink.clone());
                 let channel = Channel {
                     sender: Box::new(MemorySender {
+                        rtc: Arc::clone(&self.0),
                         peer: Arc::new(Mutex::new(Some(offer_sink))),
                         own: sink,
                         open_after: AtomicBool::new(false),
