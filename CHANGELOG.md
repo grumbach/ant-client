@@ -90,6 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wallet/network setup, so missing credentials or bootstrap configuration do not
   hide the actionable rejection; `data::validate_chunk_upload` exposes the same
   local preflight to other callers (#254).
+- In the browser, an AbortSignal aborted from a download's or `pipeTo`'s own progress callback
+  stops it there: the download rejects with the abort reason instead of delivering its other
+  chunks and resolving, and `pipeTo` aborts its destination instead of closing it. A range read
+  cancelled part-way no longer has read-ahead fetch the record after it (#244).
 - `ant node daemon info` and `ant node daemon start` no longer mistake a stale PID file for a
   running daemon (V2-1655). A daemon that dies without cleaning up (a reboot, an OOM kill)
   leaves its PID and port files behind, and once the PID is reused by an unrelated process,

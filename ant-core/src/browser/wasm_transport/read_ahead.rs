@@ -333,6 +333,7 @@ impl ReadAhead {
                 indices: HashMap::new(),
                 addresses: Vec::new(),
                 next: None,
+                finished: Cell::new(false),
             };
         }
         let read = self.next_id();
@@ -393,6 +394,7 @@ impl ReadAhead {
             indices,
             addresses,
             next,
+            finished: Cell::new(false),
         }
     }
 
@@ -594,9 +596,18 @@ pub(super) struct ReadLease {
     addresses: Vec<[u8; 32]>,
     /// The record after a read that continues no other, fetched once it ends.
     next: Option<usize>,
+    /// Whether the read finished, rather than being dropped part-way, as a
+    /// cancelled read is: only a finished read has `next` fetched.
+    finished: Cell<bool>,
 }
 
 impl ReadLease {
+    /// Marks the read finished, whatever it found: dropping the lease then
+    /// fetches the record after it.
+    pub(super) fn finish(&self) {
+        self.finished.set(true);
+    }
+
     /// The record at `address` once read-ahead's fetch of it settles: `None`
     /// when read-ahead has no fetch of it, so the read fetches it itself. A
     /// fetch that failed is an error, the read's first attempt at the record.
@@ -626,7 +637,7 @@ impl Drop for ReadLease {
             self.read_ahead.pool.awaited.remove(&self.addresses);
             self.read_ahead.last_read.set(Instant::now());
         }
-        if let Some(next) = self.next {
+        if let Some(next) = self.next.filter(|_| self.finished.get()) {
             self.read_ahead.prefetch(next);
         }
     }

@@ -226,9 +226,18 @@ impl Cancellation {
         }
     }
 
+    /// A handle on the signal for the operation's own callbacks, which run in
+    /// the middle of one of its polls and may abort it there.
+    pub(super) fn probe(&self) -> AbortProbe {
+        AbortProbe(self.0.as_ref().map(|listener| listener.signal.clone()))
+    }
+
     /// Run `operation` unless the signal aborts first. The signal is polled
     /// before the operation, so an aborted operation is dropped, stopping its
-    /// fetches and retry waits, without running again.
+    /// fetches and retry waits, without running again. One that finishes in
+    /// the poll in which a callback of its own aborted the signal fails with
+    /// the abort reason too; the callbacks themselves stop it there (see
+    /// [`AbortProbe`]).
     pub(super) async fn run<T>(
         &mut self,
         operation: impl Future<Output = Result<T, JsValue>>,
@@ -244,12 +253,28 @@ impl Cancellation {
                 Either::Right((result, _)) => Some(result),
             }
         };
-        finished.unwrap_or_else(|| {
-            Err(self
+        match finished {
+            Some(result) => self.check().and(result),
+            None => Err(self
                 .check()
                 .err()
-                .unwrap_or_else(|| JsValue::from_str(ABORTED)))
-        })
+                .unwrap_or_else(|| JsValue::from_str(ABORTED))),
+        }
+    }
+}
+
+/// An operation's AbortSignal, as its own callbacks see it. A callback, such
+/// as a progress report, runs in the middle of a poll, after the
+/// [`Cancellation`] looked at the signal for that poll: one that may abort it
+/// is followed by a look here, so the operation stops before its next record,
+/// write or close.
+#[derive(Clone)]
+pub(super) struct AbortProbe(Option<AbortSignal>);
+
+impl AbortProbe {
+    /// Whether the signal has aborted.
+    pub(super) fn aborted(&self) -> bool {
+        self.0.as_ref().is_some_and(AbortSignal::aborted)
     }
 }
 
@@ -335,6 +360,7 @@ pub(super) async fn collect(
     // The output's own error, which the caller receives instead of a message.
     let output_error = RefCell::new(None);
     settings.progress.report(&chunk_progress(0, total));
+    let probe = cancel.probe();
     cancel
         .run(async {
             shared
@@ -353,6 +379,11 @@ pub(super) async fn collect(
                             total,
                             &source,
                         ));
+                        // The report may have aborted the download: it
+                        // stops here, before another chunk.
+                        if probe.aborted() {
+                            return Err(ABORTED.to_string());
+                        }
                         Ok(())
                     },
                 )
@@ -473,6 +504,7 @@ impl BrowserFileReader {
                         lease.record(address)
                     })
                     .await;
+                lease.finish();
                 if matches!(bytes, Err(crate::data::Error::Encryption(_))) {
                     // The records do not decrypt as the DataMap declares, so
                     // reading further ahead would only spend bandwidth and
@@ -613,6 +645,7 @@ impl BrowserFileReader {
         let progress = &progress;
         let total = range.end - range.start;
         let mut hasher = blake3::Hasher::new();
+        let probe = &cancel.probe();
         cancel
             .run(async {
                 self.join_room();
@@ -639,6 +672,12 @@ impl BrowserFileReader {
                                         &JsValue::from_f64(written as f64),
                                         &JsValue::from_f64(total as f64),
                                     )?;
+                                    // The callback may have aborted the pipe:
+                                    // it stops here, before another write or
+                                    // the destination's close.
+                                    if probe.aborted() {
+                                        return Err(JsValue::from_str(ABORTED));
+                                    }
                                 }
                             }
                             Ok(())
