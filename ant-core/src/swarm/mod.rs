@@ -641,6 +641,10 @@ struct WaitingJoin {
     secret: [u8; 32],
     records: HashSet<XorName>,
     network: Network,
+    /// This wait, among every wait of this process: a hold is on one wait,
+    /// not on its room, so a hold on a wait the list dropped touches no later
+    /// wait for the same room.
+    id: u64,
     /// Cancellable reads holding it (see [`Swarm::join_held`]).
     holds: usize,
     /// Whether it stays without a hold: a caller that cannot take a join
@@ -649,6 +653,9 @@ struct WaitingJoin {
     kept: bool,
 }
 
+/// The newest wait id this process gave (see [`WaitingJoin::id`]).
+static NEXT_WAIT: AtomicU64 = AtomicU64::new(0);
+
 /// A cancellable read's hold on its file's join, which waits for a room to
 /// make way (see [`Swarm::join_held`]). The read keeps the wait when it
 /// finishes; dropping the hold first, as cancelling the read does, lets go
@@ -656,6 +663,8 @@ struct WaitingJoin {
 pub(crate) struct JoinHold {
     swarm: Swarm,
     key: RoomKey,
+    /// The wait it holds (see [`WaitingJoin::id`]).
+    id: u64,
     kept: bool,
 }
 
@@ -667,14 +676,14 @@ impl JoinHold {
     )]
     pub(crate) fn keep(mut self) {
         self.kept = true;
-        self.swarm.let_go(&self.key, true);
+        self.swarm.let_go(&self.key, self.id, true);
     }
 }
 
 impl Drop for JoinHold {
     fn drop(&mut self) {
         if !self.kept {
-            self.swarm.let_go(&self.key, false);
+            self.swarm.let_go(&self.key, self.id, false);
         }
     }
 }
@@ -945,7 +954,7 @@ impl Swarm {
         network: &Network,
     ) -> bool {
         let joined = self.try_join(key, secret, records, network);
-        self.mark_waiting(&key, |join| join.kept = true);
+        let _ = self.mark_waiting(&key, |join| join.kept = true);
         joined
     }
 
@@ -965,12 +974,16 @@ impl Swarm {
         network: &Network,
     ) -> Option<JoinHold> {
         let _ = self.try_join(key, secret, records, network);
-        self.mark_waiting(&key, |join| join.holds += 1)
-            .then(|| JoinHold {
-                swarm: self.clone(),
-                key,
-                kept: false,
-            })
+        self.mark_waiting(&key, |join| {
+            join.holds += 1;
+            join.id
+        })
+        .map(|id| JoinHold {
+            swarm: self.clone(),
+            key,
+            id,
+            kept: false,
+        })
     }
 
     fn try_join(
@@ -1002,6 +1015,7 @@ impl Swarm {
                     secret,
                     records,
                     network: network.clone(),
+                    id: NEXT_WAIT.fetch_add(1, Ordering::Relaxed),
                     holds: 0,
                     kept: false,
                 });
@@ -1150,6 +1164,7 @@ impl Swarm {
             secret,
             records,
             network,
+            id,
             holds,
             kept,
         } = waiting;
@@ -1161,6 +1176,7 @@ impl Swarm {
                     secret,
                     records,
                     network,
+                    id,
                     holds,
                     kept,
                 });
@@ -1169,33 +1185,34 @@ impl Swarm {
         }
     }
 
-    /// Marks the waiting join for `key`, if any, with `mark`. Returns
-    /// whether there is one.
-    fn mark_waiting(&self, key: &RoomKey, mark: impl FnOnce(&mut WaitingJoin)) -> bool {
+    /// Marks the waiting join for `key`, if any, with `mark`, returning what
+    /// `mark` does; `None` if no join for `key` waits.
+    fn mark_waiting<R>(
+        &self,
+        key: &RoomKey,
+        mark: impl FnOnce(&mut WaitingJoin) -> R,
+    ) -> Option<R> {
         let mut waiting = self
             .inner
             .waiting_joins
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        match waiting.iter_mut().find(|join| join.key == *key) {
-            Some(join) => {
-                mark(join);
-                true
-            }
-            None => false,
-        }
+        waiting.iter_mut().find(|join| join.key == *key).map(mark)
     }
 
-    /// A read lets go of its hold on the waiting join for `key`, if it still
-    /// waits: kept, when the read finished; otherwise dropped once no read
-    /// holds it and none kept it.
-    fn let_go(&self, key: &RoomKey, keep: bool) {
+    /// A read lets go of its hold on wait `id` of the join for `key`, if it
+    /// still waits: kept, when the read finished; otherwise dropped once no
+    /// read holds it and none kept it.
+    fn let_go(&self, key: &RoomKey, id: u64, keep: bool) {
         let mut waiting = self
             .inner
             .waiting_joins
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let Some(position) = waiting.iter().position(|join| join.key == *key) else {
+        let Some(position) = waiting
+            .iter()
+            .position(|join| join.key == *key && join.id == id)
+        else {
             return;
         };
         let unwanted = waiting.get_mut(position).is_some_and(|join| {

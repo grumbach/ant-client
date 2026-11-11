@@ -2223,6 +2223,68 @@ async fn a_waiting_join_only_cancelled_reads_held_is_dropped() {
     swarm.inner.stop.stop();
 }
 
+/// A hold is on one wait, not on its room: once the waiting list has
+/// dropped that wait for newer ones ([`MAX_WAITING_JOINS`]), letting go of
+/// the hold, or keeping it, changes nothing about a later wait for the same
+/// room.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hold_on_a_wait_the_list_dropped_leaves_a_later_wait_alone() {
+    let rtc = SharedMemoryRtc::default();
+    let swarm = Swarm::with_rtc(Some(Arc::new(rtc.clone())), 1024 * 1024);
+    let network = crate::data::Network::new_multiaddrs(&[], true, false)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let file = |n: u8| record(n, 100).0;
+    let join = |n: u8| swarm.join([n; 32], [n; 32], [file(n)], &network);
+    let held = |n: u8| swarm.join_held([n; 32], [n; 32], [file(n)], &network);
+    let rooms = u8::try_from(MAX_ROOMS).unwrap_or_else(|_| panic!("a count"));
+    let waiting = u8::try_from(MAX_WAITING_JOINS).unwrap_or_else(|_| panic!("a count"));
+    for n in 1..=rooms {
+        assert!(join(n));
+    }
+    // Pushes `count` plain waits for other files, from `from` on, so the
+    // list drops every wait older than them.
+    let crowd_out = |from: u8| {
+        for n in from..from + waiting {
+            assert!(!join(n));
+        }
+    };
+    let first = rooms + 1;
+    let dropped = held(first);
+    crowd_out(first + 1);
+    assert!(
+        !swarm.waits_to_join(&[first; 32]),
+        "the list dropped the first wait"
+    );
+    let later = held(first);
+    assert!(
+        later.is_some() && swarm.waits_to_join(&[first; 32]),
+        "a later read waits again"
+    );
+    drop(dropped);
+    assert!(
+        swarm.waits_to_join(&[first; 32]),
+        "the old hold lets go of nothing"
+    );
+    drop(later);
+    assert!(
+        !swarm.waits_to_join(&[first; 32]),
+        "the later wait's own hold lets go of it"
+    );
+
+    let second = first + 1 + waiting;
+    let kept = held(second);
+    crowd_out(second + 1);
+    let later = held(second);
+    kept.map_or_else(|| panic!("the second waited"), JoinHold::keep);
+    drop(later);
+    assert!(
+        !swarm.waits_to_join(&[second; 32]),
+        "the old hold kept nothing of the later wait"
+    );
+    swarm.inner.stop.stop();
+}
+
 #[tokio::test]
 async fn a_read_out_of_time_does_not_mark_its_peer_slow() {
     let rtc = SharedMemoryRtc::default();
