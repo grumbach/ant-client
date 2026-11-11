@@ -2441,20 +2441,6 @@ struct BrowserPrivateFileInput {
     content_type: String,
 }
 
-/// Options for `joinSwarm`, as a JavaScript object: `{ signal? }`.
-#[derive(Default, Deserialize)]
-struct JoinSwarmOptions {
-    /// AbortSignal that cancels the join.
-    #[serde(default, with = "serde_wasm_bindgen::preserve")]
-    signal: JsValue,
-}
-
-impl JoinSwarmOptions {
-    fn from_js(options: Option<JsValue>) -> Result<Self, JsValue> {
-        download::options_from_js(options).map_err(|error| JsValue::from_str(&error))
-    }
-}
-
 /// Options for `openPublicFile` and `openPrivateFile`, as a JavaScript object.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -2463,6 +2449,9 @@ struct BrowserFileReaderOptions {
     /// it, as media playback needs. Other readers read ahead only once a read
     /// continues another.
     streaming: bool,
+    /// AbortSignal that cancels the open.
+    #[serde(with = "serde_wasm_bindgen::preserve")]
+    signal: JsValue,
 }
 
 impl BrowserFileReaderOptions {
@@ -2485,8 +2474,9 @@ struct ResolvedBrowserFile {
     data_map_node: Option<BrowserNode>,
     index: self_encryption::DataMapIndex,
     /// The file's swarm room and its secret, joined as soon as the file is
-    /// resolved, and again by a read if reading other files has left it
-    /// since. `None` for a file too large for a room.
+    /// resolved unless the read was cancelled first, and again by a read if
+    /// reading other files has left it since. `None` for a file too large for
+    /// a room.
     room: Option<(RoomKey, [u8; 32])>,
 }
 
@@ -2783,7 +2773,8 @@ impl BrowserNetworkClient {
     ) -> Result<(), JsValue> {
         let address = super::protocol::normalize_hex(&address, 32)
             .map_err(|error| JsValue::from_str(&error))?;
-        let options = JoinSwarmOptions::from_js(options)?;
+        let options: download::SignalOptions =
+            download::options_from_js(options).map_err(|error| JsValue::from_str(&error))?;
         // Validates the signal before any network work, and covers the read.
         let mut cancel = download::Cancellation::new(options.signal)?;
         let root = cancel
@@ -2916,7 +2907,10 @@ impl BrowserNetworkClient {
 
     /// Resolve and validate a public file for random-access range reads.
     /// `options` is an object of `BrowserFileReaderOptions`, such as
-    /// `{ streaming: true }`; omitted fields take their defaults.
+    /// `{ streaming: true }`; omitted fields take their defaults. Its
+    /// `signal`, an AbortSignal, cancels the open: an open cancelled before
+    /// it joins the file's swarm room joins none. Errors are JavaScript values
+    /// so an AbortSignal's reason reaches the caller.
     #[wasm_bindgen(js_name = openPublicFile)]
     pub async fn open_public_file(
         &self,
@@ -2930,7 +2924,6 @@ impl BrowserNetworkClient {
         let progress = ProgressReporter::from_js(on_progress);
         self.open_file_inner(BrowserFileSource::Public(file), progress, options)
             .await
-            .map_err(|error| JsValue::from_str(&error))
     }
 
     /// Resolve a private file from its DataMap for random-access range reads.
@@ -2948,7 +2941,6 @@ impl BrowserNetworkClient {
         let progress = ProgressReporter::from_js(on_progress);
         self.open_file_inner(BrowserFileSource::Private(file), progress, options)
             .await
-            .map_err(|error| JsValue::from_str(&error))
     }
 
     /// Self-encrypt, quote, pay through a wallet callback, and store a public file.
@@ -3136,13 +3128,24 @@ impl BrowserNetworkClient {
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
+    /// Errors are JavaScript values so an AbortSignal's reason reaches the caller.
     async fn open_file_inner(
         &self,
         source: BrowserFileSource,
         progress: ProgressReporter,
         options: BrowserFileReaderOptions,
-    ) -> Result<BrowserFileReader, String> {
-        let resolved = self.resolve_file(source, &progress).await?;
+    ) -> Result<BrowserFileReader, JsValue> {
+        let BrowserFileReaderOptions { streaming, signal } = options;
+        // Validates the signal before any network work, and covers resolution.
+        let mut cancel = download::Cancellation::new(signal)?;
+        let resolved = cancel
+            .run(async {
+                self.resolve_file(source, &progress)
+                    .await
+                    .map_err(|error| JsValue::from_str(&error))
+            })
+            .await?;
+        self.join_file_room(&resolved, &progress, &cancel)?;
         progress.report(&format!(
             "Ready to stream {} ({} bytes, {} chunks)",
             resolved.file.name,
@@ -3153,7 +3156,7 @@ impl BrowserNetworkClient {
             Rc::clone(&self.shared),
             resolved,
             &self.read_ahead,
-            options.streaming,
+            streaming,
         ))
     }
 
@@ -3172,6 +3175,7 @@ impl BrowserNetworkClient {
                     .map_err(|error| JsValue::from_str(&error))
             })
             .await?;
+        self.join_file_room(&resolved, &settings.progress, &cancel)?;
         let (content, hash) =
             download::collect(&self.shared, &resolved.index, &settings, &mut cancel).await?;
         let file = download::completed_descriptor(resolved.file, &resolved.index, hash.clone());
@@ -3260,6 +3264,25 @@ impl BrowserNetworkClient {
             .await
     }
 
+    /// Joins the swarm room of `resolved`, a file a read has just resolved,
+    /// and says so in the read's `progress`, unless the read's signal has
+    /// aborted. The signal is checked after that progress callback, which may
+    /// abort it, and nothing yields between the check and the join.
+    fn join_file_room(
+        &self,
+        resolved: &ResolvedBrowserFile,
+        progress: &ProgressReporter,
+        cancel: &download::Cancellation,
+    ) -> Result<(), JsValue> {
+        if let Some((room, secret)) = resolved.room {
+            progress.report(&format!("Swarm room {}", crate::swarm::room_tag(&secret)));
+            cancel.check()?;
+            self.shared
+                .join_swarm_room(room, secret, swarm_records(&resolved.index));
+        }
+        Ok(())
+    }
+
     /// The root map of the public file at `address`, which names its room.
     async fn join_swarm_root(&self, address: &str) -> Result<DataMap, String> {
         let progress = ProgressReporter(None);
@@ -3309,14 +3332,10 @@ impl BrowserNetworkClient {
             return Err("file size exceeds JavaScript's exact integer range".into());
         }
         // The file's room and records are its root map's, once it is known to
-        // be one this page can read. Joined at once, so its other readers are
+        // be one this page can read. The read joins it as soon as it has
+        // resolved the file (see `join_file_room`), so its other readers are
         // being found while the first records come from the nodes.
         let room = crate::swarm::room_of(&root_data_map);
-        if let Some((room, secret)) = room {
-            progress.report(&format!("Swarm room {}", crate::swarm::room_tag(&secret)));
-            self.shared
-                .join_swarm_room(room, secret, swarm_records(&index));
-        }
 
         file.size = index.file_size();
         file.chunks = Vec::new(); // Listed from the index once the file is read.

@@ -106,6 +106,14 @@ struct PipeResult {
     hash: String,
 }
 
+/// Options of an operation that only an AbortSignal can change: `{ signal? }`.
+#[derive(Default, Deserialize)]
+pub(super) struct SignalOptions {
+    /// AbortSignal that cancels the operation.
+    #[serde(default, with = "serde_wasm_bindgen::preserve")]
+    pub(super) signal: JsValue,
+}
+
 /// Complete-download options: `{ maxMemoryBytes?, signal? }`.
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -433,8 +441,15 @@ impl BrowserFileReader {
 
     /// Read up to 4 MiB. Positions above 4 GiB are supported without truncation.
     /// Fractions, negatives, and integers not exactly representable in JS fail.
+    /// `options` is `{ signal? }`: an AbortSignal that cancels the read. A read
+    /// cancelled before it starts does not join the file's room again.
     #[wasm_bindgen(js_name = readRange)]
-    pub async fn read_range(&self, start: f64, length: f64) -> Result<Uint8Array, JsValue> {
+    pub async fn read_range(
+        &self,
+        start: f64,
+        length: f64,
+        options: Option<JsValue>,
+    ) -> Result<Uint8Array, JsValue> {
         if self.closed.get() {
             return Err(JsValue::from_str(CLOSED_READER));
         }
@@ -445,21 +460,29 @@ impl BrowserFileReader {
                 "browser range reads are limited to {MAX_BROWSER_RANGE_BYTES} bytes"
             )));
         }
-        self.join_room();
-        let lease = self.read_ahead.begin_read(start, length as usize);
-        let bytes = self
-            .shared
-            .data_download_indexed_range(&self.index, start, length as usize, |address| {
-                lease.record(address)
+        let options: SignalOptions = options_from_js(options).map_err(js_string)?;
+        let mut cancel = Cancellation::new(options.signal)?;
+        // The signal is checked before the read's first poll, which joins.
+        cancel
+            .run(async {
+                self.join_room();
+                let lease = self.read_ahead.begin_read(start, length as usize);
+                let bytes = self
+                    .shared
+                    .data_download_indexed_range(&self.index, start, length as usize, |address| {
+                        lease.record(address)
+                    })
+                    .await;
+                if matches!(bytes, Err(crate::data::Error::Encryption(_))) {
+                    // The records do not decrypt as the DataMap declares, so
+                    // reading further ahead would only spend bandwidth and
+                    // memory.
+                    self.read_ahead.close();
+                }
+                let bytes = bytes.map_err(js_string)?;
+                Ok(Uint8Array::from(bytes.as_ref()))
             })
-            .await;
-        if matches!(bytes, Err(crate::data::Error::Encryption(_))) {
-            // The records do not decrypt as the DataMap declares, so reading
-            // further ahead would only spend bandwidth and memory.
-            self.read_ahead.close();
-        }
-        let bytes = bytes.map_err(js_string)?;
-        Ok(Uint8Array::from(bytes.as_ref()))
+            .await
     }
 
     /// Write the file to a WritableStream (including a file-system writable).
