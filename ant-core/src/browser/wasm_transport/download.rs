@@ -211,7 +211,7 @@ impl Cancellation {
     }
 
     /// Fail with the abort reason once the signal has aborted.
-    fn check(&self) -> Result<(), JsValue> {
+    pub(super) fn check(&self) -> Result<(), JsValue> {
         match self.0.as_ref().and_then(AbortListener::reason) {
             Some(reason) => Err(reason),
             None => Ok(()),

@@ -38,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `swarm_stats` and `swarm_room_stats`, with `SwarmStats` (its `discovery` field a
   `DiscoveryStats`; it also counts the reads that asked no peer and why, `reads_*`, and the asks
   this client refused and why, `refused_*`) and `RoomStats` (each open link's `OpenLinkPeer` names the peer it reaches,
-  for that room only). In the browser: `joinSwarm`, `swarmStats` and `swarmRoomStats`, and a
+  for that room only). In the browser: `joinSwarm` (whose optional `{ signal }` cancels a join
+  that has not joined yet), `swarmStats` and `swarmRoomStats`, and a
   `Swarm room <tag>` progress line when a file opens; a downloaded chunk another reader sent
   reports `from a reader` in its progress (#244).
 - `ant file download` prints swarm totals after a successful read and adds the exact `swarm` and

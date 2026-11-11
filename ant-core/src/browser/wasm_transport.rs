@@ -2441,6 +2441,20 @@ struct BrowserPrivateFileInput {
     content_type: String,
 }
 
+/// Options for `joinSwarm`, as a JavaScript object: `{ signal? }`.
+#[derive(Default, Deserialize)]
+struct JoinSwarmOptions {
+    /// AbortSignal that cancels the join.
+    #[serde(default, with = "serde_wasm_bindgen::preserve")]
+    signal: JsValue,
+}
+
+impl JoinSwarmOptions {
+    fn from_js(options: Option<JsValue>) -> Result<Self, JsValue> {
+        download::options_from_js(options).map_err(|error| JsValue::from_str(&error))
+    }
+}
+
 /// Options for `openPublicFile` and `openPrivateFile`, as a JavaScript object.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -2754,25 +2768,37 @@ impl BrowserNetworkClient {
     /// it can serve this one, and this one them. Every read of the file does
     /// this itself; joining before a read gives the client time to meet the
     /// others first, so more of the file comes from them. Reads the file's
-    /// DataMap, whose root names the room.
+    /// DataMap, whose root names the room. `options` is `{ signal? }`: an
+    /// AbortSignal that cancels the join. A join aborted before it has the
+    /// root map stops reading it and joins no room, so nothing looks up the
+    /// room; once it has joined, aborting changes nothing.
+    ///
+    /// Errors are JavaScript values so an AbortSignal's reason reaches the
+    /// caller.
     #[wasm_bindgen(js_name = joinSwarm)]
-    pub async fn join_swarm(&self, address: String) -> Result<(), JsValue> {
+    pub async fn join_swarm(
+        &self,
+        address: String,
+        options: Option<JsValue>,
+    ) -> Result<(), JsValue> {
         let address = super::protocol::normalize_hex(&address, 32)
             .map_err(|error| JsValue::from_str(&error))?;
-        let progress = ProgressReporter(None);
-        let (encoded, _) = self
-            .get_shared_chunk(&address, &progress)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        let published = crate::client_engine::files::decode_map(&encoded)
-            .map_err(|error| JsValue::from_str(&error))?;
-        let root = self
-            .resolve_root(&published, &progress)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
+        let options = JoinSwarmOptions::from_js(options)?;
+        // Validates the signal before any network work, and covers the read.
+        let mut cancel = download::Cancellation::new(options.signal)?;
+        let root = cancel
+            .run(async {
+                self.join_swarm_root(&address)
+                    .await
+                    .map_err(|error| JsValue::from_str(&error))
+            })
+            .await?;
         if crate::swarm::file_records(&root).is_none() {
             return Err(JsValue::from_str("not the DataMap of a file"));
         }
+        // Nothing yields between this check and the join, so an abort the
+        // caller made before it is seen here.
+        cancel.check()?;
         // A file too large for a room is read from the nodes alone: joining
         // it does nothing.
         self.shared.swarm_room_now(&root);
@@ -3232,6 +3258,14 @@ impl BrowserNetworkClient {
         };
         self.resolve_data_map(&file.data_map, descriptor, progress)
             .await
+    }
+
+    /// The root map of the public file at `address`, which names its room.
+    async fn join_swarm_root(&self, address: &str) -> Result<DataMap, String> {
+        let progress = ProgressReporter(None);
+        let (encoded, _) = self.get_shared_chunk(address, &progress).await?;
+        let published = crate::client_engine::files::decode_map(&encoded)?;
+        self.resolve_root(&published, &progress).await
     }
 
     /// The root map of `published`, resolving nested DataMap records.
