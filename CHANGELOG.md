@@ -41,7 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for that room only). In the browser: `joinSwarm` (whose optional `{ signal }` cancels a join
   that has not joined yet), `swarmStats` and `swarmRoomStats`; `openPublicFile` and
   `openPrivateFile` take a `signal` too, as does `readRange` (`{ signal }`), and a download,
-  open or range read cancelled before it joins its file's room joins none; and a
+  open or range read cancelled before it joins its file's room joins none, nor leaves a join
+  waiting for a room to make way; `stopSwarm` leaves every room and closes every link at once,
+  while the connections to the nodes stay open for what still runs; and a
   `Swarm room <tag>` progress line when a file opens; a downloaded chunk another reader sent
   reports `from a reader` in its progress (#244).
 - `ant file download` prints swarm totals after a successful read and adds the exact `swarm` and

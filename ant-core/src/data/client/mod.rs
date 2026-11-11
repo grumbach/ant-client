@@ -38,6 +38,8 @@ use crate::data::network::NetworkHealth;
 #[cfg(feature = "native")]
 use crate::data::peer_cache;
 use crate::data::{DataMap, RoomStats, SwarmStats};
+#[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+use crate::swarm::JoinHold;
 use ant_protocol::evm::Wallet;
 #[cfg(feature = "native")]
 use ant_protocol::transport::P2PNode;
@@ -1053,6 +1055,20 @@ impl Client {
         records: impl IntoIterator<Item = XorName>,
     ) {
         self.swarm.join(room, secret, records, &self.network);
+    }
+
+    /// The same, for a read that may yet be cancelled: if the join waits for
+    /// a room to make way, returns the read's hold on it, which the read
+    /// keeps when it finishes; dropped first, it lets go of the wait (see
+    /// [`JoinHold`]).
+    #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+    pub(crate) fn join_swarm_room_held(
+        &self,
+        room: RoomKey,
+        secret: [u8; 32],
+        records: impl IntoIterator<Item = XorName>,
+    ) -> Option<JoinHold> {
+        self.swarm.join_held(room, secret, records, &self.network)
     }
 
     /// Adaptive concurrency controller. Hot loops read

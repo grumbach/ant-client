@@ -2144,6 +2144,85 @@ async fn a_waiting_join_is_made_once_a_room_goes_unread_when_its_file_is_joined_
     swarm.inner.stop.stop();
 }
 
+/// A join a cancellable read makes waits like any other, but stays only while
+/// a read holds it, a read that held it finished, or a caller that cannot
+/// take it back made it: a wait that only cancelled reads held is dropped, and
+/// no later read of its records makes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_join_only_cancelled_reads_held_is_dropped() {
+    let rtc = SharedMemoryRtc::default();
+    let swarm = Swarm::with_rtc(Some(Arc::new(rtc.clone())), 1024 * 1024);
+    let network = crate::data::Network::new_multiaddrs(&[], true, false)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let file = |n: u8| record(n, 100).0;
+    let join = |n: u8| swarm.join([n; 32], [n; 32], [file(n)], &network);
+    let held = |n: u8| swarm.join_held([n; 32], [n; 32], [file(n)], &network);
+    let gone_unread = |swarm: &Swarm| {
+        let long_ago = crate::runtime::Clock::now()
+            .checked_sub(ROOM_TURNOVER * 2)
+            .unwrap_or_else(|| panic!("a time"));
+        for room in swarm.inner.rooms().iter() {
+            room.note_read(long_ago);
+        }
+    };
+    let rooms = u8::try_from(MAX_ROOMS).unwrap_or_else(|_| panic!("a count"));
+    for n in 1..=rooms {
+        assert!(join(n));
+    }
+    // Two reads hold a fifth file's waiting join; it stays while one does.
+    let fifth = rooms + 1;
+    let (first, second) = (held(fifth), held(fifth));
+    assert!(
+        first.is_some() && second.is_some(),
+        "both reads hold the wait"
+    );
+    drop(first);
+    assert!(
+        swarm.waits_to_join(&[fifth; 32]),
+        "the other read still holds it"
+    );
+    drop(second);
+    assert!(
+        !swarm.waits_to_join(&[fifth; 32]),
+        "no read holds it any more"
+    );
+    // A sixth's read finishes, and a seventh's is made by a join that cannot
+    // be taken back: a cancelled read renewing either lets go of nothing.
+    let sixth = fifth + 1;
+    held(sixth).map_or_else(|| panic!("the sixth waits"), JoinHold::keep);
+    let seventh = sixth + 1;
+    assert!(!join(seventh));
+    drop(held(sixth));
+    drop(held(seventh));
+    assert!(
+        swarm.waits_to_join(&[sixth; 32]),
+        "a finished read keeps its wait"
+    );
+    assert!(
+        swarm.waits_to_join(&[seventh; 32]),
+        "a plain join's wait is kept"
+    );
+    // Once a room has gone unread, a read of the fifth file's records makes
+    // nothing, while one of the sixth's makes its join.
+    gone_unread(&swarm);
+    let reading = swarm.fetching(&file(fifth), true);
+    assert!(
+        swarm.inner.room(&[fifth; 32]).is_none(),
+        "the dropped wait is not made"
+    );
+    drop(reading);
+    let reading = swarm.fetching(&file(sixth), true);
+    assert!(
+        swarm.inner.room(&[sixth; 32]).is_some(),
+        "the kept wait is made"
+    );
+    drop(reading);
+    // A read held for a room the client is in, or joins now, holds nothing.
+    assert!(held(sixth).is_none());
+    swarm.inner.stop.stop();
+}
+
 #[tokio::test]
 async fn a_read_out_of_time_does_not_mark_its_peer_slow() {
     let rtc = SharedMemoryRtc::default();

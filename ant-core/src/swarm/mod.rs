@@ -641,6 +641,42 @@ struct WaitingJoin {
     secret: [u8; 32],
     records: HashSet<XorName>,
     network: Network,
+    /// Cancellable reads holding it (see [`Swarm::join_held`]).
+    holds: usize,
+    /// Whether it stays without a hold: a caller that cannot take a join
+    /// back made or renewed it, or a read that held it finished. Otherwise
+    /// it is dropped once no read holds it.
+    kept: bool,
+}
+
+/// A cancellable read's hold on its file's join, which waits for a room to
+/// make way (see [`Swarm::join_held`]). The read keeps the wait when it
+/// finishes; dropping the hold first, as cancelling the read does, lets go
+/// of it, and a wait no read holds or kept is dropped.
+pub(crate) struct JoinHold {
+    swarm: Swarm,
+    key: RoomKey,
+    kept: bool,
+}
+
+impl JoinHold {
+    /// The read finished: its join waits on, as a plain join's does.
+    #[cfg_attr(
+        not(all(feature = "browser-wasm", target_arch = "wasm32")),
+        allow(dead_code)
+    )]
+    pub(crate) fn keep(mut self) {
+        self.kept = true;
+        self.swarm.let_go(&self.key, true);
+    }
+}
+
+impl Drop for JoinHold {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.swarm.let_go(&self.key, false);
+        }
+    }
 }
 
 /// A membership number newer than every one this process gave before; see
@@ -899,7 +935,45 @@ impl Swarm {
     /// such, the join waits (at most [`MAX_WAITING_JOINS`] do) and is made
     /// once a room has gone unread, when the file is joined again or a read
     /// of one of its records starts or ends.
+    /// A join made this way cannot be taken back: if it waits, the wait stays
+    /// until it is made or the waiting list drops it ([`MAX_WAITING_JOINS`]).
     pub(crate) fn join(
+        &self,
+        key: RoomKey,
+        secret: [u8; 32],
+        records: impl IntoIterator<Item = XorName>,
+        network: &Network,
+    ) -> bool {
+        let joined = self.try_join(key, secret, records, network);
+        self.mark_waiting(&key, |join| join.kept = true);
+        joined
+    }
+
+    /// The same, for a read that may yet be cancelled before it finishes:
+    /// if the join waits, returns the read's hold on it, which the read
+    /// keeps when it finishes (see [`JoinHold`]). `None` if it does not wait:
+    /// the client is in the room, has just joined it, or joins nothing.
+    #[cfg_attr(
+        not(all(feature = "browser-wasm", target_arch = "wasm32")),
+        allow(dead_code)
+    )]
+    pub(crate) fn join_held(
+        &self,
+        key: RoomKey,
+        secret: [u8; 32],
+        records: impl IntoIterator<Item = XorName>,
+        network: &Network,
+    ) -> Option<JoinHold> {
+        let _ = self.try_join(key, secret, records, network);
+        self.mark_waiting(&key, |join| join.holds += 1)
+            .then(|| JoinHold {
+                swarm: self.clone(),
+                key,
+                kept: false,
+            })
+    }
+
+    fn try_join(
         &self,
         key: RoomKey,
         secret: [u8; 32],
@@ -922,11 +996,14 @@ impl Swarm {
         match self.enter(key, secret, records, network) {
             Ok(joined) => joined,
             Err(records) => {
+                // Its caller marks it held or kept.
                 self.wait_to_join(WaitingJoin {
                     key,
                     secret,
                     records,
                     network: network.clone(),
+                    holds: 0,
+                    kept: false,
                 });
                 false
             }
@@ -1073,6 +1150,8 @@ impl Swarm {
             secret,
             records,
             network,
+            holds,
+            kept,
         } = waiting;
         match self.enter(key, secret, records, &network) {
             Ok(_) => self.inner.room(&key).is_some(),
@@ -1082,9 +1161,53 @@ impl Swarm {
                     secret,
                     records,
                     network,
+                    holds,
+                    kept,
                 });
                 false
             }
+        }
+    }
+
+    /// Marks the waiting join for `key`, if any, with `mark`. Returns
+    /// whether there is one.
+    fn mark_waiting(&self, key: &RoomKey, mark: impl FnOnce(&mut WaitingJoin)) -> bool {
+        let mut waiting = self
+            .inner
+            .waiting_joins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match waiting.iter_mut().find(|join| join.key == *key) {
+            Some(join) => {
+                mark(join);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A read lets go of its hold on the waiting join for `key`, if it still
+    /// waits: kept, when the read finished; otherwise dropped once no read
+    /// holds it and none kept it.
+    fn let_go(&self, key: &RoomKey, keep: bool) {
+        let mut waiting = self
+            .inner
+            .waiting_joins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(position) = waiting.iter().position(|join| join.key == *key) else {
+            return;
+        };
+        let unwanted = waiting.get_mut(position).is_some_and(|join| {
+            join.holds = join.holds.saturating_sub(1);
+            join.kept |= keep;
+            join.holds == 0 && !join.kept
+        });
+        if unwanted {
+            let _ = waiting.remove(position);
+            self.inner
+                .joins_wait
+                .store(!waiting.is_empty(), Ordering::Release);
         }
     }
 

@@ -278,6 +278,17 @@ impl AbortProbe {
     }
 }
 
+/// Keeps a read's `hold` on a join it made wait once the read has ended,
+/// unless its signal aborted: a read dropped part-way, as a cancelled one
+/// is, never gets here and lets go of it (see [`JoinHold`]).
+fn keep_unless_aborted(hold: Option<JoinHold>, probe: &AbortProbe) {
+    if !probe.aborted() {
+        if let Some(hold) = hold {
+            hold.keep();
+        }
+    }
+}
+
 /// Fetch and decrypt `chunks` and hand each to `write` in file order. Fetching
 /// continues while a write is pending, within the client's adaptive fetch cap,
 /// until the chunks in flight, fetched and being written hold
@@ -493,10 +504,11 @@ impl BrowserFileReader {
         }
         let options: SignalOptions = options_from_js(options).map_err(js_string)?;
         let mut cancel = Cancellation::new(options.signal)?;
+        let probe = cancel.probe();
         // The signal is checked before the read's first poll, which joins.
         cancel
             .run(async {
-                self.join_room();
+                let hold = self.join_room();
                 let lease = self.read_ahead.begin_read(start, length as usize);
                 let bytes = self
                     .shared
@@ -505,6 +517,7 @@ impl BrowserFileReader {
                     })
                     .await;
                 lease.finish();
+                keep_unless_aborted(hold, &probe);
                 if matches!(bytes, Err(crate::data::Error::Encryption(_))) {
                     // The records do not decrypt as the DataMap declares, so
                     // reading further ahead would only spend bandwidth and
@@ -590,12 +603,13 @@ impl BrowserFileReader {
     }
 
     /// Joins the file's room again as a read starts, if reading other files
-    /// has left it since the file was opened, which joined it.
-    fn join_room(&self) {
-        if let Some((room, secret)) = self.room {
-            self.shared
-                .join_swarm_room(room, secret, swarm_records(&self.index));
-        }
+    /// has left it since the file was opened, which joined it. Returns the
+    /// read's hold on the join if it waits for a room to make way: the read
+    /// keeps it when it ends uncancelled (see [`keep_unless_aborted`]).
+    fn join_room(&self) -> Option<JoinHold> {
+        let (room, secret) = self.room?;
+        self.shared
+            .join_swarm_room_held(room, secret, swarm_records(&self.index))
     }
 
     /// Validate a `pipeTo` call before it touches the destination.
@@ -648,8 +662,8 @@ impl BrowserFileReader {
         let probe = &cancel.probe();
         cancel
             .run(async {
-                self.join_room();
-                stream_chunks(
+                let hold = self.join_room();
+                let streamed = stream_chunks(
                     &self.shared,
                     &self.index,
                     self.index.chunks_overlapping(range.clone()),
@@ -684,8 +698,13 @@ impl BrowserFileReader {
                         }
                     },
                 )
-                .await?;
-                JsFuture::from(writer.close()).await.map(drop)
+                .await;
+                let closed = match streamed {
+                    Ok(()) => JsFuture::from(writer.close()).await.map(drop),
+                    Err(error) => Err(error),
+                };
+                keep_unless_aborted(hold, probe);
+                closed
             })
             .await?;
         serde_wasm_bindgen::to_value(&PipeResult {

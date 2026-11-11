@@ -88,3 +88,45 @@ test("a readRange cancelled while it fetches has read-ahead fetch nothing after 
     assert.equal(fetched.size, 1, "only the cancelled read's own record was asked for");
   } finally { reader?.close(); client.close(); }
 });
+
+// The last report of an open or a download comes after its room is joined:
+// an abort there still rejects, the open returning no reader.
+const lastReports = {
+  "openPublicFile": [(client, onProgress, signal) => client.openPublicFile(datamap.address, onProgress, { signal }), /^Ready to stream /u],
+  "openPrivateFile": [(client, onProgress, signal) => client.openPrivateFile({ data_map: datamap.content }, onProgress, { signal }), /^Ready to stream /u],
+  "downloadPublicFile": [(client, onProgress, signal) => client.downloadPublicFile(datamap.address, undefined, onProgress, { signal }), /^Verified complete /u],
+  "downloadPrivateFile": [(client, onProgress, signal) => client.downloadPrivateFile({ data_map: datamap.content }, undefined, onProgress, { signal }), /^Verified complete /u],
+};
+for (const [name, [read, last]] of Object.entries(lastReports)) {
+  test(`${name} aborted in its last progress report rejects`, async () => {
+    const rtc = network();
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    const abort = new AbortController();
+    const reason = new Error(`cancelled at ${name}'s last report`);
+    const onProgress = message => { if (last.test(String(message))) abort.abort(reason); };
+    try {
+      await assert.rejects(read(client, onProgress, abort.signal), error => error === reason);
+      assert.ok(abort.signal.aborted, "the last report came");
+    } finally { client.close(); }
+  });
+}
+
+// stopSwarm leaves every room and joins none after, while the client's
+// transport stays open: the SDK's close() stops sharing at once even while a
+// paid write still needs the transport.
+test("stopSwarm leaves every room and joins none after, while reads go on", async () => {
+  const rtc = network();
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  try {
+    reader = await client.openPublicFile(datamap.address);
+    assert.equal(client.swarmStats().rooms, 1);
+    client.stopSwarm();
+    assert.equal(client.swarmStats().rooms, 0, "every room left");
+    assert.deepEqual(await reader.readRange(0, 10), content.slice(0, 10), "reads go on");
+    const downloaded = await client.downloadPublicFile(datamap.address, undefined);
+    assert.deepEqual(downloaded.content, content);
+    await client.joinSwarm(datamap.address);
+    assert.equal(client.swarmStats().rooms, 0, "no room joined after");
+  } finally { reader?.close(); client.close(); }
+});

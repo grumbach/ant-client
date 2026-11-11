@@ -20,6 +20,7 @@ use super::protocol::{
 use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::DataMap;
+use crate::swarm::JoinHold;
 #[cfg(feature = "test-utils")]
 use crate::transfer_policy::PutRejection;
 use crate::transfer_policy::RpcError;
@@ -2480,6 +2481,16 @@ struct ResolvedBrowserFile {
     room: Option<(RoomKey, [u8; 32])>,
 }
 
+/// Keeps a read's `hold` on a join it made wait, unless the read's signal
+/// has aborted: a cancelled read lets go of it (see [`JoinHold`]).
+fn keep_unless_cancelled(hold: Option<JoinHold>, cancel: &download::Cancellation) {
+    if cancel.check().is_ok() {
+        if let Some(hold) = hold {
+            hold.keep();
+        }
+    }
+}
+
 /// The records of the file `index` covers, as its room shares them.
 fn swarm_records(index: &self_encryption::DataMapIndex) -> impl Iterator<Item = XorName> + '_ {
     index.infos().iter().map(|info| info.dst_hash.0)
@@ -3069,6 +3080,16 @@ impl BrowserNetworkClient {
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
+    /// Stop sharing now: leave every swarm room, close every link to another
+    /// reader and join no room after, while the connections to the nodes
+    /// stay open for the operations still running, such as a paid write
+    /// still settling. Reads go on, from the nodes alone. `close` does this
+    /// too.
+    #[wasm_bindgen(js_name = stopSwarm)]
+    pub fn stop_swarm(&self) {
+        self.shared.swarm().shutdown();
+    }
+
     /// Close all pooled WebRTC associations.
     pub fn close(&self) {
         self.shared.swarm().shutdown();
@@ -3145,13 +3166,17 @@ impl BrowserNetworkClient {
                     .map_err(|error| JsValue::from_str(&error))
             })
             .await?;
-        self.join_file_room(&resolved, &progress, &cancel)?;
+        let hold = self.join_file_room(&resolved, &progress, &cancel)?;
         progress.report(&format!(
             "Ready to stream {} ({} bytes, {} chunks)",
             resolved.file.name,
             resolved.file.size,
             resolved.index.infos().len()
         ));
+        // The report may have aborted the open: it then returns no reader and
+        // lets go of a join it made wait.
+        cancel.check()?;
+        keep_unless_cancelled(hold, &cancel);
         Ok(BrowserFileReader::new(
             Rc::clone(&self.shared),
             resolved,
@@ -3175,19 +3200,27 @@ impl BrowserNetworkClient {
                     .map_err(|error| JsValue::from_str(&error))
             })
             .await?;
-        self.join_file_room(&resolved, &settings.progress, &cancel)?;
-        let (content, hash) =
-            download::collect(&self.shared, &resolved.index, &settings, &mut cancel).await?;
-        let file = download::completed_descriptor(resolved.file, &resolved.index, hash.clone());
-        settings
-            .progress
-            .report(&format!("Verified complete {} as {hash}", file.name));
-        Ok(BrowserDownloadResult {
-            content,
-            hash,
-            file,
-            data_map_node: resolved.data_map_node,
-        })
+        let hold = self.join_file_room(&resolved, &settings.progress, &cancel)?;
+        let collected =
+            download::collect(&self.shared, &resolved.index, &settings, &mut cancel).await;
+        let result = collected.and_then(|(content, hash)| {
+            let file = download::completed_descriptor(resolved.file, &resolved.index, hash.clone());
+            settings
+                .progress
+                .report(&format!("Verified complete {} as {hash}", file.name));
+            // The report may have aborted the download.
+            cancel.check()?;
+            Ok(BrowserDownloadResult {
+                content,
+                hash,
+                file,
+                data_map_node: resolved.data_map_node,
+            })
+        });
+        // A download that ended, whether it read the file or failed, keeps a
+        // join it made wait, as a plain read does; one cancelled lets go.
+        keep_unless_cancelled(hold, &cancel);
+        result
     }
 
     async fn resolve_file(
@@ -3267,20 +3300,23 @@ impl BrowserNetworkClient {
     /// Joins the swarm room of `resolved`, a file a read has just resolved,
     /// and says so in the read's `progress`, unless the read's signal has
     /// aborted. The signal is checked after that progress callback, which may
-    /// abort it, and nothing yields between the check and the join.
+    /// abort it, and nothing yields between the check and the join. Returns
+    /// the read's hold on the join if it waits for a room to make way: the
+    /// read keeps it when it ends uncancelled (see [`keep_unless_cancelled`]).
     fn join_file_room(
         &self,
         resolved: &ResolvedBrowserFile,
         progress: &ProgressReporter,
         cancel: &download::Cancellation,
-    ) -> Result<(), JsValue> {
-        if let Some((room, secret)) = resolved.room {
-            progress.report(&format!("Swarm room {}", crate::swarm::room_tag(&secret)));
-            cancel.check()?;
-            self.shared
-                .join_swarm_room(room, secret, swarm_records(&resolved.index));
-        }
-        Ok(())
+    ) -> Result<Option<JoinHold>, JsValue> {
+        let Some((room, secret)) = resolved.room else {
+            return Ok(None);
+        };
+        progress.report(&format!("Swarm room {}", crate::swarm::room_tag(&secret)));
+        cancel.check()?;
+        Ok(self
+            .shared
+            .join_swarm_room_held(room, secret, swarm_records(&resolved.index)))
     }
 
     /// The root map of the public file at `address`, which names its room.
