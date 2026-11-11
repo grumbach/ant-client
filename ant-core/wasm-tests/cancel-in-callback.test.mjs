@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BrowserNetworkClient } from "./client-fixture.mjs";
-import { encryptPublicFile, test_room_lookup_queued_at_stop } from "./pkg/ant_core.js";
+import { encryptPublicFile, test_guarded_request_queued_at_stop, test_room_lookup_queued_at_stop } from "./pkg/ant_core.js";
 import { mockWebRtc } from "./mock-webrtc.mjs";
 
 // An AbortSignal can abort inside one of the operation's own callbacks, which
@@ -170,4 +170,13 @@ test("a room lookup queued when sharing stops asks the node nothing", async () =
   const error = await test_room_lookup_queued_at_stop(rtc.endpoints[0]);
   assert.match(error, /stopped sharing/u);
   assert.deepEqual(rtc.requests.filter(request => request.method === "find_node"), [], "no lookup request sent");
+});
+
+// One queue further: the lookup's request is handed to the session's sender
+// task, queued when sharing stops, and runs after the stop.
+test("a room's request whose sender is queued when sharing stops is not sent", async () => {
+  const rtc = mockWebRtc([{}]);
+  const before = () => rtc.requests.filter(request => request.method === "find_node").length;
+  await test_guarded_request_queued_at_stop(rtc.endpoints[0]);
+  assert.equal(before(), 0, "no lookup request sent");
 });

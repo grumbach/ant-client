@@ -67,6 +67,10 @@ async fn next_change(receiver: &mut watch::Receiver<()>) {
     }
 }
 
+/// Whether a request must no longer be sent: looked at right before its
+/// first frame (a swarm room's lookup, once the client stops sharing).
+pub(super) type SendGuard = Rc<dyn Fn() -> bool>;
+
 pub(super) struct RpcSession {
     channel: RtcDataChannel,
     inbox: Rc<ResponseInbox>,
@@ -235,6 +239,8 @@ impl RpcSession {
             .map_err(|_| RpcError::Timeout("WebRTC admission timed out waiting for peer".into()))?
     }
 
+    /// `guard`, when there is one, is looked at right before the request's
+    /// first frame: once it says so, the request is not sent.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn request(
         self: &Rc<Self>,
@@ -244,6 +250,7 @@ impl RpcSession {
         read_permit: Option<ReadPermit>,
         permit: Option<SessionSlot>,
         exclusive: bool,
+        guard: Option<SendGuard>,
     ) -> Result<(BrowserResponseFrame, Duration, Option<ReadPermit>), RpcError> {
         // Preserve per-lane PUT serialization: several complete incoming PUTs
         // would consume the node's byte budget before any one can finish. Give
@@ -293,7 +300,21 @@ impl RpcSession {
                 }
                 Either::Right(_) => return,
             };
-            if sender.is_canceled() || session.closed.get() {
+            if guard.is_some() {
+                // The exchange sends its first frame in its first poll once
+                // the buffer has room: wait for that room here, so nothing
+                // yields between the guard's look below and that frame.
+                let _ = wait_for_buffer(
+                    &session.channel,
+                    MAX_BUFFERED_AMOUNT,
+                    RPC_ADMISSION_TIMEOUT.as_millis() as u32,
+                )
+                .await;
+            }
+            if sender.is_canceled()
+                || session.closed.get()
+                || guard.as_ref().is_some_and(|stopped| stopped())
+            {
                 return;
             }
             let result = session.exchange(id, plaintext, timeout, lock).await;

@@ -18,6 +18,7 @@ use super::protocol::{
     MAX_BROWSER_RESPONSE_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
+use crate::client_engine::read_budget::ReadPermit;
 use crate::data::client::merkle::PaymentMode;
 use crate::data::DataMap;
 use crate::swarm::JoinHold;
@@ -362,6 +363,12 @@ impl BrowserClientLease {
         room: bool,
     ) -> Result<Vec<BrowserNode>, String> {
         let (mut sender, receiver) = oneshot::channel();
+        // A room's request is not sent once the client stops sharing, even
+        // from a task the stop did not reach in time.
+        let guard = room.then(|| {
+            let availability = Rc::clone(&self.availability);
+            Rc::new(move || availability.swarm_stopped.get()) as multiplex::SendGuard
+        });
         wasm_bindgen_futures::spawn_local(async move {
             let result = {
                 let request = async {
@@ -388,7 +395,7 @@ impl BrowserClientLease {
                         Either::Left((client, _)) => client.map_err(|error| error.to_string())?,
                         Either::Right(_) => return Err("lookup waiter cancelled".into()),
                     };
-                    client.find_node(&target, count).await
+                    client.find_node_guarded(&target, count, guard).await
                 };
                 let request = async {
                     match select(Box::pin(request), Box::pin(self.availability.wait_closed())).await
@@ -1522,15 +1529,31 @@ impl LockedBrowserClient<'_> {
         body: BrowserRequestBody,
         content: &[u8],
         response_timeout: Duration,
-        read_permit: Option<crate::client_engine::read_budget::ReadPermit>,
+        read_permit: Option<ReadPermit>,
         exclusive: bool,
-    ) -> Result<
-        (
-            BrowserResponseFrame,
-            Option<crate::client_engine::read_budget::ReadPermit>,
-        ),
-        RpcError,
-    > {
+    ) -> Result<(BrowserResponseFrame, Option<ReadPermit>), RpcError> {
+        self.request_guarded(
+            body,
+            content,
+            response_timeout,
+            read_permit,
+            exclusive,
+            None,
+        )
+        .await
+    }
+
+    /// The same, sent only if `guard` has not said to stop by the time its
+    /// first frame would go (see [`multiplex::SendGuard`]).
+    async fn request_guarded(
+        &self,
+        body: BrowserRequestBody,
+        content: &[u8],
+        response_timeout: Duration,
+        read_permit: Option<ReadPermit>,
+        exclusive: bool,
+        guard: Option<multiplex::SendGuard>,
+    ) -> Result<(BrowserResponseFrame, Option<ReadPermit>), RpcError> {
         self.check_bootstrap_policy()?;
         if self
             .authenticated_generation
@@ -1567,6 +1590,7 @@ impl LockedBrowserClient<'_> {
                 read_permit,
                 slot,
                 exclusive,
+                guard,
             )
             .await?;
         self.response_processing.set(processing);
@@ -1662,6 +1686,17 @@ impl LockedBrowserClient<'_> {
         target: &str,
         count: usize,
     ) -> Result<Vec<BrowserNode>, String> {
+        self.find_node_guarded(target, count, None).await
+    }
+
+    /// The same, asked only if `guard` has not said to stop by the time the
+    /// request's first frame would go (a swarm room's lookup).
+    pub(super) async fn find_node_guarded(
+        &self,
+        target: &str,
+        count: usize,
+        guard: Option<multiplex::SendGuard>,
+    ) -> Result<Vec<BrowserNode>, String> {
         let target = super::protocol::normalize_hex(target, 32)?;
         let require_owner_proofs = self
             .hello
@@ -1671,16 +1706,21 @@ impl LockedBrowserClient<'_> {
             .capabilities
             .iter()
             .any(|capability| capability == ant_protocol::transport::ADDRESS_V2_CAPABILITY);
-        let response = self
-            .request(
+        let (response, _) = self
+            .request_guarded(
                 BrowserRequestBody::FindNode {
                     with_address_records: true,
                     target: target.clone(),
                     count: Some(count),
                 },
                 &[],
+                Duration::from_millis(u64::from(REQUEST_TIMEOUT_MS)),
+                None,
+                false,
+                guard,
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
         let BrowserResponseBody::Nodes {
             target: response_target,
             mut nodes,

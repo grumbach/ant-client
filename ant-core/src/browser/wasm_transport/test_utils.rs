@@ -315,6 +315,43 @@ pub async fn test_active_data_lane_capacity(endpoints: JsValue) {
     pool.close();
 }
 
+/// A guarded request (a swarm room's lookup) handed to its session's sender
+/// task, which is queued when the guard says to stop: the task runs after
+/// the stop and must send nothing. Resolves with the request's error, or
+/// fails if it was sent.
+#[wasm_bindgen]
+pub async fn test_guarded_request_queued_at_stop(endpoint: &str) -> Result<String, JsValue> {
+    let endpoint = parse_webrtc_direct_multiaddr(endpoint)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let client = BrowserNodeClientCore::new(endpoint);
+    let stopped = Rc::new(Cell::new(false));
+    let guard: multiplex::SendGuard = {
+        let stopped = Rc::clone(&stopped);
+        Rc::new(move || stopped.get())
+    };
+    let result = {
+        let authenticated = client
+            .authenticated()
+            .await
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let target = "11".repeat(32);
+        let mut request = Box::pin(authenticated.find_node_guarded(&target, 20, Some(guard)));
+        // The first poll hands the request to the sender task, queued.
+        if futures::poll!(&mut request).is_ready() {
+            return Err(JsValue::from_str("the request ended before its sender ran"));
+        }
+        stopped.set(true);
+        request.await
+    };
+    client.close();
+    match result {
+        Ok(_) => Err(JsValue::from_str(
+            "the guarded request was sent after the stop",
+        )),
+        Err(error) => Ok(error),
+    }
+}
+
 /// A swarm room's lookup whose task is already queued when the client stops
 /// sharing: the task runs after the stop, on an authenticated session, and
 /// must send no request. Resolves with the lookup's error, or fails if the
@@ -1629,7 +1666,7 @@ pub async fn test_speculative_read_after_abandoned_put(endpoint: &str) -> bool {
     client.hello().await.unwrap();
     let rpc = client.current_rpc().unwrap();
     let active = rpc.admit(RPC_ADMISSION_TIMEOUT).await.unwrap();
-    let put = rpc.request(0, Vec::new(), RPC_ADMISSION_TIMEOUT, None, None, true);
+    let put = rpc.request(0, Vec::new(), RPC_ADMISSION_TIMEOUT, None, None, true, None);
     let speculative = || true;
     // Never changes, so only the returned slots can admit the GET.
     let (_priority, changed) = watch::channel(());
