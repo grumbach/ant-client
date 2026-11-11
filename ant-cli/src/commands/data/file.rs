@@ -1232,6 +1232,15 @@ mod tests {
                 asks_busy: 4,
                 asks_missing: 5,
                 asks_failed: 6,
+                reads_held: 32,
+                reads_not_offered: 33,
+                reads_links_full: 34,
+                reads_receiving_full: 35,
+                reads_hidden: 36,
+                refused_missing: 37,
+                refused_busy_link: 38,
+                refused_busy_reading: 39,
+                refused_busy_uploads: 40,
                 records_served: 7,
                 bytes_served: 8,
                 links: 9,
@@ -1285,6 +1294,15 @@ mod tests {
                 "asks_busy",
                 "asks_missing",
                 "asks_failed",
+                "reads_held",
+                "reads_not_offered",
+                "reads_links_full",
+                "reads_receiving_full",
+                "reads_hidden",
+                "refused_missing",
+                "refused_busy_link",
+                "refused_busy_reading",
+                "refused_busy_uploads",
                 "records_served",
                 "bytes_served",
                 "links",
@@ -1331,6 +1349,8 @@ mod tests {
             &["fingerprint", "peer"],
         );
         assert_eq!(json["swarm"]["records_from_peers"], 1);
+        assert_eq!(json["swarm"]["reads_not_offered"], 33);
+        assert_eq!(json["swarm"]["refused_busy_reading"], 39);
         assert_eq!(json["swarm"]["discovery"]["links_failed"], 25);
         assert_eq!(json["swarm_rooms"][0]["records_from_peers"], 26);
     }

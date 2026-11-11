@@ -16,7 +16,7 @@ pub(crate) const MAX_RECORD_BYTES: usize = ant_protocol::MAX_CHUNK_SIZE;
 /// The data of one piece frame. Browsers deliver data channel messages of
 /// up to 256 KiB everywhere; 16 KiB frames keep any one message small.
 pub(crate) const FRAME_BYTES: usize = 16 * 1024;
-/// Addresses in one [`Message::Have`].
+/// Addresses in one [`Message::Have`] or [`Message::Gone`].
 pub(crate) const MAX_HAVE_ADDRESSES: usize = 512;
 /// The largest message a peer may send.
 pub(crate) const MAX_MESSAGE_BYTES: usize = 1 + 4 + 4 + 4 + FRAME_BYTES;
@@ -35,6 +35,7 @@ const MISSING: u8 = 0x05;
 const CANCEL: u8 = 0x06;
 const BUSY: u8 = 0x07;
 const PROOF: u8 = 0x08;
+const GONE: u8 = 0x09;
 
 /// One message between two clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,10 @@ pub(crate) enum Message {
     Hello { key: Vec<u8> },
     /// Records the sender holds and will serve.
     Have { addresses: Vec<XorName> },
+    /// Records the sender said it held and holds no longer: dropped from its
+    /// store to make room for newer ones. The peer stops asking for them,
+    /// until a later `Have` names them again.
+    Gone { addresses: Vec<XorName> },
     /// Asks for a record; answered by pieces or [`Message::Missing`].
     Get { id: u32, address: XorName },
     /// Part of the record asked for by `id`: `total` bytes in all, this frame
@@ -91,16 +96,8 @@ impl Message {
     pub(crate) fn encode(&self) -> Vec<u8> {
         match self {
             Self::Hello { key } => [&[HELLO][..], key].concat(),
-            Self::Have { addresses } => {
-                let mut out = Vec::with_capacity(1 + 2 + addresses.len() * 32);
-                out.push(HAVE);
-                let count = u16::try_from(addresses.len().min(MAX_HAVE_ADDRESSES)).unwrap_or(0);
-                out.extend_from_slice(&count.to_be_bytes());
-                for address in addresses.iter().take(usize::from(count)) {
-                    out.extend_from_slice(address);
-                }
-                out
-            }
+            Self::Have { addresses } => encode_addresses(HAVE, addresses),
+            Self::Gone { addresses } => encode_addresses(GONE, addresses),
             Self::Get { id, address } => {
                 let mut out = Vec::with_capacity(37);
                 out.push(GET);
@@ -139,17 +136,12 @@ impl Message {
             HELLO => Self::Hello {
                 key: reader.bytes(MEMBER_KEY_BYTES)?.to_vec(),
             },
-            HAVE => {
-                let count = usize::from(u16::from_be_bytes(reader.array()?));
-                if count > MAX_HAVE_ADDRESSES {
-                    return Err(WireError::TooManyAddresses);
-                }
-                let mut addresses = Vec::with_capacity(count);
-                for _ in 0..count {
-                    addresses.push(reader.array()?);
-                }
-                Self::Have { addresses }
-            }
+            HAVE => Self::Have {
+                addresses: reader.addresses()?,
+            },
+            GONE => Self::Gone {
+                addresses: reader.addresses()?,
+            },
             GET => Self::Get {
                 id: u32::from_be_bytes(reader.array()?),
                 address: reader.array()?,
@@ -194,6 +186,19 @@ impl Message {
         }
         Ok(message)
     }
+}
+
+/// A list of addresses, as [`Message::Have`] and [`Message::Gone`] carry it:
+/// a count, then that many addresses, at most [`MAX_HAVE_ADDRESSES`].
+fn encode_addresses(kind: u8, addresses: &[XorName]) -> Vec<u8> {
+    let count = u16::try_from(addresses.len().min(MAX_HAVE_ADDRESSES)).unwrap_or(0);
+    let mut out = Vec::with_capacity(1 + 2 + usize::from(count) * 32);
+    out.push(kind);
+    out.extend_from_slice(&count.to_be_bytes());
+    for address in addresses.iter().take(usize::from(count)) {
+        out.extend_from_slice(address);
+    }
+    out
 }
 
 /// Splits a record into the pieces that carry it.
@@ -294,6 +299,20 @@ impl<'a> Reader<'a> {
     fn rest(&self) -> &'a [u8] {
         self.0
     }
+
+    /// A count and that many addresses, refused past [`MAX_HAVE_ADDRESSES`]
+    /// before any is read.
+    fn addresses(&mut self) -> Result<Vec<XorName>, WireError> {
+        let count = usize::from(u16::from_be_bytes(self.array()?));
+        if count > MAX_HAVE_ADDRESSES {
+            return Err(WireError::TooManyAddresses);
+        }
+        let mut addresses = Vec::with_capacity(count);
+        for _ in 0..count {
+            addresses.push(self.array()?);
+        }
+        Ok(addresses)
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +327,9 @@ mod tests {
             },
             Message::Have {
                 addresses: vec![[1; 32], [2; 32]],
+            },
+            Message::Gone {
+                addresses: vec![[6; 32]],
             },
             Message::Get {
                 id: 9,
@@ -344,9 +366,11 @@ mod tests {
         assert_eq!(Message::decode(&long_key), Err(WireError::TooLarge));
         let short_signature = [&[PROOF][..], &[1; 32], &[2; MEMBER_SIGNATURE_BYTES - 1]].concat();
         assert_eq!(Message::decode(&short_signature), Err(WireError::Truncated));
-        let mut too_many = vec![HAVE];
-        too_many.extend_from_slice(&u16::MAX.to_be_bytes());
-        assert_eq!(Message::decode(&too_many), Err(WireError::TooManyAddresses));
+        for kind in [HAVE, GONE] {
+            let mut too_many = vec![kind];
+            too_many.extend_from_slice(&u16::MAX.to_be_bytes());
+            assert_eq!(Message::decode(&too_many), Err(WireError::TooManyAddresses));
+        }
         let past_end = Message::Piece {
             id: 1,
             total: 2,

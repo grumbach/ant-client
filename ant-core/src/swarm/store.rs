@@ -43,29 +43,33 @@ impl RecordStore {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Keeps a record the caller has checked against its address. Returns
-    /// whether it is new here.
-    pub(crate) fn insert(&self, address: XorName, record: Bytes) -> bool {
+    /// Keeps a record the caller has checked against its address: `None` if
+    /// it is held already, or larger than the whole store; otherwise the
+    /// addresses of the records dropped to make room for it, oldest first,
+    /// which links told of them must be told are gone.
+    pub(crate) fn insert(&self, address: XorName, record: Bytes) -> Option<Vec<XorName>> {
         let cost = charge(&record);
         if cost > self.max_bytes {
-            return false;
+            return None;
         }
         let mut inner = self.lock();
         if inner.records.contains_key(&address) {
-            return false;
+            return None;
         }
+        let mut dropped = Vec::new();
         while inner.bytes + cost > self.max_bytes {
             let Some(oldest) = inner.order.pop_front() else {
                 break;
             };
-            if let Some(dropped) = inner.records.remove(&oldest) {
-                inner.bytes = inner.bytes.saturating_sub(charge(&dropped));
+            if let Some(record) = inner.records.remove(&oldest) {
+                inner.bytes = inner.bytes.saturating_sub(charge(&record));
+                dropped.push(oldest);
             }
         }
         inner.bytes += cost;
         inner.order.push_back(address);
         inner.records.insert(address, record);
-        true
+        Some(dropped)
     }
 
     pub(crate) fn get(&self, address: &XorName) -> Option<Bytes> {
@@ -107,11 +111,14 @@ mod tests {
     fn the_oldest_records_go_first_when_full() {
         let record = |byte: u8| Bytes::from(vec![byte; MIN_CHARGE]);
         let store = RecordStore::new(2 * MIN_CHARGE + MIN_CHARGE / 2);
-        assert!(store.insert([1; 32], record(1)));
-        assert!(store.insert([2; 32], record(2)));
-        assert!(!store.insert([2; 32], record(2)));
-        assert!(store.insert([3; 32], record(3)));
+        assert_eq!(store.insert([1; 32], record(1)), Some(vec![]));
+        assert_eq!(store.insert([2; 32], record(2)), Some(vec![]));
+        assert_eq!(store.insert([2; 32], record(2)), None);
+        // The oldest makes room, and the caller learns which it was.
+        assert_eq!(store.insert([3; 32], record(3)), Some(vec![[1; 32]]));
         assert_eq!(store.get(&[1; 32]), None);
+        assert!(!store.contains(&[1; 32]));
+        assert!(store.contains(&[3; 32]));
         assert_eq!(store.newest_where(8, |_| true), vec![[3; 32], [2; 32]]);
         assert_eq!(store.newest_where(1, |_| true), vec![[3; 32]]);
         assert_eq!(
@@ -119,14 +126,25 @@ mod tests {
             vec![[2; 32]]
         );
         assert_eq!(store.bytes(), 2 * MIN_CHARGE);
-        assert!(!store.insert([4; 32], Bytes::from(vec![0u8; 3 * MIN_CHARGE])));
+        assert_eq!(
+            store.insert([4; 32], Bytes::from(vec![0u8; 3 * MIN_CHARGE])),
+            None
+        );
+        // One record larger than those it pushes out drops them all.
+        assert_eq!(
+            store.insert([5; 32], Bytes::from(vec![0u8; 2 * MIN_CHARGE])),
+            Some(vec![[2; 32], [3; 32]])
+        );
+        assert_eq!(store.bytes(), 2 * MIN_CHARGE);
     }
 
     #[test]
     fn a_tiny_record_costs_as_much_as_the_least_charge() {
         let store = RecordStore::new(4 * MIN_CHARGE);
         for seed in 0..100u8 {
-            assert!(store.insert([seed; 32], Bytes::from_static(b"abc")));
+            assert!(store
+                .insert([seed; 32], Bytes::from_static(b"abc"))
+                .is_some());
         }
         // However small, at most four fit.
         assert_eq!(store.newest_where(usize::MAX, |_| true).len(), 4);

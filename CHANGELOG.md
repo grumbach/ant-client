@@ -28,12 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nodes, never instead of them: a peer keeps a read while it is on pace to finish within about
   as long as the nodes take now, then the nodes are read too, and the first record that checks
   against its address wins. Finding peers runs on its own and never delays a read, and a
-  client sends other readers one record at a time while its own fetches run; nodes stay the last
-  seed, and nodes without swarm rooms are read as before. Each client asks for a file's records
+  client sends other readers one record at a time while its own fetches run (another number,
+  from 0 to 4, with `ANT_SWARM_UPLOADS_WHILE_READING` natively or `setSwarmUploadsWhileReading`
+  in the browser); nodes stay the last seed, and nodes without swarm rooms are read as before. A
+  record a client drops from its store to make room is taken back from the readers it was
+  announced to, so they stop asking it for that record. Each client asks for a file's records
   in an order of its own, the same for each of its downloads; a native download, which writes
   the file in order, takes that order within each decrypt batch. Always on. In `ant-core`: `Client::join_swarm`,
   `swarm_stats` and `swarm_room_stats`, with `SwarmStats` (its `discovery` field a
-  `DiscoveryStats`) and `RoomStats` (each open link's `OpenLinkPeer` names the peer it reaches,
+  `DiscoveryStats`; it also counts the reads that asked no peer and why, `reads_*`, and the asks
+  this client refused and why, `refused_*`) and `RoomStats` (each open link's `OpenLinkPeer` names the peer it reaches,
   for that room only). In the browser: `joinSwarm`, `swarmStats` and `swarmRoomStats`, and a
   `Swarm room <tag>` progress line when a file opens; a downloaded chunk another reader sent
   reports `from a reader` in its progress (#244).

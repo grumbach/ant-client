@@ -58,6 +58,8 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, Semaphore};
+#[cfg(feature = "native")]
+use tracing::warn;
 
 use crate::client_engine::files::MIN_FILE_CHUNKS;
 use crate::data::{DataMap, Network, XorName};
@@ -95,8 +97,15 @@ const MAX_LINKS: usize = 16;
 const MAX_UPLOADS: usize = 4;
 /// Records a client sends at once while fetches of its own are running: a
 /// record sent costs the sender's CPU and line, which its own download needs
-/// first. A client done fetching sends [`MAX_UPLOADS`].
+/// first. A client done fetching sends [`MAX_UPLOADS`]. A native client takes
+/// another number from [`UPLOADS_WHILE_READING_ENV`], a browser page from
+/// `setSwarmUploadsWhileReading` (see [`Swarm::set_uploads_while_reading`]).
 const UPLOADS_WHILE_READING: usize = 1;
+/// The environment variable a native client's swarm reads when it starts:
+/// the records it sends at once while fetches of its own run, from 0 to
+/// [`MAX_UPLOADS`], in place of [`UPLOADS_WHILE_READING`].
+#[cfg(feature = "native")]
+pub(crate) const UPLOADS_WHILE_READING_ENV: &str = "ANT_SWARM_UPLOADS_WHILE_READING";
 /// Offers a client answers at once, each until the node has taken its answer.
 const MAX_ANSWERS: usize = 8;
 /// Records a client takes from other clients at once; reads past this go to
@@ -127,6 +136,37 @@ pub struct SwarmStats {
     pub asks_missing: u64,
     /// Asks that failed: the link closed, or the record ran out of time.
     pub asks_failed: u64,
+    /// Reads of a room's record that found it held already. This and the
+    /// four counts after it are of the times a read looked to its peers and
+    /// asked none: once at most for a read of a native client; a browser
+    /// read still waiting for its turn at the nodes looks again when a peer
+    /// offers its record, and may count again.
+    pub reads_held: u64,
+    /// Reads no open link of the record's rooms said it holds the record
+    /// for (or only links lately too slow to ask).
+    pub reads_not_offered: u64,
+    /// Reads whose record links said they hold, but each had as many reads
+    /// asking and waiting as it takes.
+    pub reads_links_full: u64,
+    /// Reads made while this client was receiving as many records from
+    /// peers as it takes at once.
+    pub reads_receiving_full: u64,
+    /// Reads made while the page was hidden (a browser's only).
+    pub reads_hidden: u64,
+    /// Asks of other clients this one answered it does not hold the record
+    /// for, in the asker's room.
+    pub refused_missing: u64,
+    /// Asks it answered `Busy` because it was sending the asker's link as
+    /// many records as one link may have at once.
+    pub refused_busy_link: u64,
+    /// Asks it answered `Busy` because it was sending as many records as it
+    /// does while fetches of its own run: 1, unless
+    /// `ANT_SWARM_UPLOADS_WHILE_READING` (natively) or
+    /// `setSwarmUploadsWhileReading` (in a browser) set another number.
+    pub refused_busy_reading: u64,
+    /// Asks it answered `Busy` because it was sending as many records as it
+    /// ever does at once.
+    pub refused_busy_uploads: u64,
     /// Records this client sent to other clients.
     pub records_served: u64,
     /// Their bytes.
@@ -248,6 +288,9 @@ struct Spent {
     deadline: Option<web_time::Instant>,
     tries: usize,
     tried: Vec<u64>,
+    /// Whether the read has asked a link yet: one that took no ask, being
+    /// full, was not asked.
+    asked: bool,
 }
 
 /// A read's [`Spent`], taken for one ask and given back however it ends.
@@ -302,6 +345,15 @@ impl Pace {
 /// [`Inner::start_upload`]).
 pub(crate) struct Upload(Arc<AtomicUsize>);
 
+/// Why [`Inner::start_upload`] had no place for another send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadsTaken {
+    /// As many as this client sends while fetches of its own run.
+    WhileReading,
+    /// [`MAX_UPLOADS`].
+    All,
+}
+
 impl Drop for Upload {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
@@ -328,7 +380,9 @@ impl Drop for Reading {
     }
 }
 
-/// What a swarm, or one of its rooms, fetched and served.
+/// What a swarm, or one of its rooms, fetched and served. A room counts only
+/// what [`RoomStats`] shows; the reads that asked no peer, and the asks
+/// refused, are counted for the whole swarm alone.
 #[derive(Default)]
 pub(crate) struct Counters {
     records_from_peers: AtomicU64,
@@ -337,8 +391,22 @@ pub(crate) struct Counters {
     asks_busy: AtomicU64,
     asks_missing: AtomicU64,
     asks_failed: AtomicU64,
+    reads_held: AtomicU64,
+    reads_not_offered: AtomicU64,
+    reads_links_full: AtomicU64,
+    reads_receiving_full: AtomicU64,
+    reads_hidden: AtomicU64,
+    refused_missing: AtomicU64,
+    refused_busy_link: AtomicU64,
+    refused_busy_reading: AtomicU64,
+    refused_busy_uploads: AtomicU64,
     records_served: AtomicU64,
     bytes_served: AtomicU64,
+}
+
+/// Adds one to `counter`.
+fn count_one(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 impl Counters {
@@ -648,8 +716,14 @@ pub(crate) struct Inner {
     rooms: Mutex<Vec<Arc<Room>>>,
     /// Turns for rooms left to tell their nodes so.
     leaving: Arc<Semaphore>,
+    /// Held while the store changes and the links are told of it, and while a
+    /// new link is told what the store holds (see [`Inner::publishing`]).
+    publishing: Mutex<()>,
     /// Records being sent to other clients now.
     uploads: Arc<AtomicUsize>,
+    /// How many may be while fetches of this client's own run: at most
+    /// [`MAX_UPLOADS`].
+    uploads_while_reading: AtomicUsize,
     /// This client's own fetches running now (see [`Swarm::fetching`]).
     reading: Arc<AtomicUsize>,
     /// The records those reads are reading, and how many reads each: a room
@@ -681,8 +755,25 @@ pub(crate) struct Inner {
 
 impl Default for Swarm {
     fn default() -> Self {
-        Self::with_rtc(rtc::platform(), STORE_BYTES)
+        let swarm = Self::with_rtc(rtc::platform(), STORE_BYTES);
+        #[cfg(feature = "native")]
+        if let Ok(value) = std::env::var(UPLOADS_WHILE_READING_ENV) {
+            match uploads_while_reading(&value) {
+                Some(uploads) => swarm.set_uploads_while_reading(uploads),
+                None => warn!(
+                    "{UPLOADS_WHILE_READING_ENV}={value:?} is not a number of records; \
+                     sending {UPLOADS_WHILE_READING} at once while reading"
+                ),
+            }
+        }
+        swarm
     }
+}
+
+/// The number [`UPLOADS_WHILE_READING_ENV`] is set to, if it is one.
+#[cfg(any(test, feature = "native"))]
+fn uploads_while_reading(value: &str) -> Option<usize> {
+    value.trim().parse().ok()
 }
 
 /// The swarms of this process, by the native node identity they speak as.
@@ -726,7 +817,9 @@ impl Swarm {
                 links: Mutex::default(),
                 rooms: Mutex::default(),
                 leaving: Arc::new(Semaphore::new(MAX_LEAVING)),
+                publishing: Mutex::default(),
                 uploads: Arc::default(),
+                uploads_while_reading: AtomicUsize::new(UPLOADS_WHILE_READING),
                 reading: Arc::default(),
                 active_reads: Mutex::default(),
                 answers: Arc::new(Semaphore::new(MAX_ANSWERS)),
@@ -776,6 +869,24 @@ impl Swarm {
             }
         }
         places
+    }
+
+    /// Sets how many records this client sends other clients at once while
+    /// fetches of its own run: from 0 to [`MAX_UPLOADS`] (more is taken as
+    /// [`MAX_UPLOADS`]), [`UPLOADS_WHILE_READING`] until set. Sends already
+    /// running finish.
+    #[cfg_attr(
+        not(any(
+            test,
+            feature = "native",
+            all(feature = "browser-wasm", target_arch = "wasm32")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn set_uploads_while_reading(&self, uploads: usize) {
+        self.inner
+            .uploads_while_reading
+            .store(uploads.min(MAX_UPLOADS), Ordering::Relaxed);
     }
 
     /// Joins the room for a file being read, if not in it already, through
@@ -1040,20 +1151,24 @@ impl Swarm {
         // Held already, checked when it came: from another client on the same
         // node, or read before and kept out of the chunk cache. A record in
         // for the read, so its rooms may start finding other readers.
+        let counters = &self.inner.counters;
         if let Some(record) = self.inner.store.get(address) {
             for key in &rooms {
                 self.start_finding(key);
             }
             pace.held.store(true, Ordering::Relaxed);
+            count_one(&counters.reads_held);
             return Some(record);
         }
         // A hidden page's timers are slowed to a second or more, which would
         // stretch the peers' deadlines far past their bounds: its reads go
         // to the nodes. It still serves, as its sends wait on channel events.
         if crate::runtime::page_hidden() {
+            count_one(&counters.reads_hidden);
             return None;
         }
         let Ok(_receiving) = Arc::clone(&self.inner.receiving).try_acquire_owned() else {
+            count_one(&counters.reads_receiving_full);
             return None;
         };
         // A page hidden meanwhile has its timers slowed too: the read leaves
@@ -1076,6 +1191,7 @@ impl Swarm {
             deadline,
             tries,
             tried,
+            asked,
         } = &mut spending.spent;
         let counters = &self.inner.counters;
         // Peers are picked afresh for each try, so a link that opens or
@@ -1112,16 +1228,20 @@ impl Swarm {
             tried.push(link.id);
             let until =
                 *deadline.get_or_insert_with(|| web_time::Instant::now() + link::FETCH_TOTAL);
-            let record = match link.get(*address, until, pace).await {
+            let outcome = link.get(*address, until, pace).await;
+            *asked |= !matches!(outcome, GetOutcome::Full | GetOutcome::NotOffered);
+            let record = match outcome {
                 GetOutcome::Record(record) => record,
                 GetOutcome::Busy => {
                     counters.asks_busy.fetch_add(1, Ordering::Relaxed);
                     *tries += 1;
                     continue;
                 }
-                // Asked and waited on by as many reads as it takes: this read
-                // tries another link, or the nodes.
-                GetOutcome::Full => continue,
+                // Asked and waited on by as many reads as it takes, or no
+                // longer offering the record once the read's turn came:
+                // nothing was asked, and this read tries another link, or the
+                // nodes.
+                GetOutcome::Full | GetOutcome::NotOffered => continue,
                 GetOutcome::Missing => {
                     counters.asks_missing.fetch_add(1, Ordering::Relaxed);
                     *tries += 1;
@@ -1153,6 +1273,19 @@ impl Swarm {
             link.room_counters.fetched(record.len());
             self.seed(*address, record.clone());
             return Some(record);
+        }
+        // A read that has asked no peer yet, and why: none offers the record,
+        // or each that does takes no more asks now.
+        if !*asked {
+            let offered =
+                self.inner.links().iter().any(|link| {
+                    rooms.contains(&link.room) && link.is_open() && link.offers(address)
+                });
+            count_one(if offered {
+                &counters.reads_links_full
+            } else {
+                &counters.reads_not_offered
+            });
         }
         None
     }
@@ -1245,16 +1378,28 @@ impl Swarm {
         for key in &rooms {
             self.start_finding(key);
         }
-        if rooms.is_empty() || !self.inner.store.insert(address, record) {
+        if rooms.is_empty() {
             return;
         }
-        for link in self
-            .inner
-            .links()
-            .iter()
-            .filter(|link| rooms.contains(&link.room) && link.is_open())
-        {
-            link.announce(&[address]);
+        // What the store keeps and drops, and what the links are told of it,
+        // change together, one record at a time: a link hears of a record
+        // kept and dropped in the order the store saw, never a stale `Gone`
+        // after a newer `Have`.
+        let _publishing = self.inner.publishing();
+        let Some(dropped) = self.inner.store.insert(address, record) else {
+            return;
+        };
+        // Records dropped to make room are taken back from the links they
+        // were announced on: those of rooms whose file holds them, and no
+        // others, which never heard of them.
+        let dropped = self.inner.by_room(&dropped);
+        for link in self.inner.links().iter().filter(|link| link.is_open()) {
+            if rooms.contains(&link.room) {
+                link.announce(&[address]);
+            }
+            if let Some((_, gone)) = dropped.iter().find(|(room, _)| *room == link.room) {
+                link.retract(gone);
+            }
         }
     }
 
@@ -1283,6 +1428,15 @@ impl Swarm {
             asks_busy: load(&counters.asks_busy),
             asks_missing: load(&counters.asks_missing),
             asks_failed: load(&counters.asks_failed),
+            reads_held: load(&counters.reads_held),
+            reads_not_offered: load(&counters.reads_not_offered),
+            reads_links_full: load(&counters.reads_links_full),
+            reads_receiving_full: load(&counters.reads_receiving_full),
+            reads_hidden: load(&counters.reads_hidden),
+            refused_missing: load(&counters.refused_missing),
+            refused_busy_link: load(&counters.refused_busy_link),
+            refused_busy_reading: load(&counters.refused_busy_reading),
+            refused_busy_uploads: load(&counters.refused_busy_uploads),
             records_served: load(&counters.records_served),
             bytes_served: load(&counters.bytes_served),
             links,
@@ -1341,25 +1495,61 @@ impl Swarm {
 }
 
 impl Inner {
-    /// A place to send a record now, or `None`: [`MAX_UPLOADS`] at once, and
-    /// [`UPLOADS_WHILE_READING`] while fetches of this client's own run, taken
-    /// in one step so two links never both take the last. Sends already
-    /// running when a read starts finish.
-    fn start_upload(&self) -> Option<Upload> {
+    /// A place to send a record now, or why not: [`MAX_UPLOADS`] at once,
+    /// and fewer while fetches of this client's own run
+    /// ([`UPLOADS_WHILE_READING`] unless set otherwise), taken in one step so
+    /// two links never both take the last. Sends already running when a read
+    /// starts finish.
+    fn start_upload(&self) -> Result<Upload, UploadsTaken> {
         let limit = if self.reading.load(Ordering::Acquire) > 0 {
-            UPLOADS_WHILE_READING
+            self.uploads_while_reading.load(Ordering::Relaxed)
         } else {
             MAX_UPLOADS
         };
         update_usize(&self.uploads, |running| {
             (running < limit).then_some(running + 1)
         })
-        .ok()?;
-        Some(Upload(Arc::clone(&self.uploads)))
+        .map_err(|running| {
+            if running < MAX_UPLOADS {
+                UploadsTaken::WhileReading
+            } else {
+                UploadsTaken::All
+            }
+        })?;
+        Ok(Upload(Arc::clone(&self.uploads)))
+    }
+
+    /// `addresses` grouped by the rooms this client is in whose file holds
+    /// them, those of no such room left out.
+    fn by_room(&self, addresses: &[XorName]) -> Vec<(RoomKey, Vec<XorName>)> {
+        if addresses.is_empty() {
+            return Vec::new();
+        }
+        self.rooms()
+            .iter()
+            .filter_map(|room| {
+                let held: Vec<XorName> = addresses
+                    .iter()
+                    .filter(|address| room.holds(address))
+                    .copied()
+                    .collect();
+                (!held.is_empty()).then_some((room.key, held))
+            })
+            .collect()
     }
 
     fn links(&self) -> MutexGuard<'_, Vec<Arc<Link>>> {
         self.links.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The turn to change the store and tell the links, or to tell a new link
+    /// what the store holds: one at a time, so every link hears of each
+    /// record in the order the store kept and dropped it. Taken before the
+    /// rooms, the links and the store, never while holding one of them.
+    pub(super) fn publishing(&self) -> MutexGuard<'_, ()> {
+        self.publishing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn rooms(&self) -> MutexGuard<'_, Vec<Arc<Room>>> {

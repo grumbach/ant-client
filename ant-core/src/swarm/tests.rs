@@ -260,11 +260,12 @@ async fn a_record_nobody_announced_is_left_to_the_nodes() {
     let (address, _) = record(2, 100);
     knows(&[&alice, &bob], &[address]);
     assert_eq!(bob.fetch(&address).await, None);
-    // Nothing asked, fetched or served: only the link counts, and how it
-    // was made.
+    // Nothing asked, fetched or served: only the link counts, how it was
+    // made, and the read that found no peer offering its record.
     assert_eq!(
         bob.stats(),
         SwarmStats {
+            reads_not_offered: 1,
             links: 1,
             rooms: 1,
             discovery: DiscoveryStats {
@@ -631,7 +632,7 @@ async fn records_held_already_are_told_to_links_opened_before_they_were_register
     let (address, content) = record(1, 2 * wire::FRAME_BYTES);
     // Held from an earlier read, in a room left since: not a record of this
     // room yet when the link opens.
-    assert!(alice.inner.store.insert(address, content));
+    assert!(alice.inner.store.insert(address, content).is_some());
     let mut peer = hand_driven(&rtc, &alice).await;
     eventually("the link opens", || alice.stats().links == 1).await;
     knows(&[&alice], &[address]);
@@ -906,6 +907,17 @@ async fn a_peer_sends_only_so_many_records_at_once() {
     }
     assert_eq!(finished, 2);
     assert_eq!(busy, 4);
+    // Each refusal counted where it was made: the link had as many records
+    // being sent as one may.
+    let stats = alice.stats();
+    assert_eq!(
+        (
+            stats.refused_busy_link,
+            stats.refused_busy_reading,
+            stats.refused_busy_uploads
+        ),
+        (4, 0, 0)
+    );
 }
 
 #[tokio::test]
@@ -948,6 +960,7 @@ async fn a_peer_still_reading_sends_one_record_at_a_time() {
         }
     }
     assert_eq!((finished, busy), (1, 2));
+    assert_eq!(alice.stats().refused_busy_reading, 2);
     // Done reading, she sends as many as any peer does.
     drop(reading);
     for (id, (address, _)) in (10u32..).zip(&records) {
@@ -974,6 +987,12 @@ async fn a_peer_still_reading_sends_one_record_at_a_time() {
         }
     }
     assert_eq!((finished, busy), (2, 1));
+    // Past the link's own limit now, not the one for reading.
+    let stats = alice.stats();
+    assert_eq!(
+        (stats.refused_busy_reading, stats.refused_busy_link),
+        (2, 1)
+    );
 }
 
 #[tokio::test]
@@ -1260,6 +1279,7 @@ async fn a_record_of_another_room_is_neither_announced_nor_served() {
         }
     };
     assert_eq!(answer, Message::Missing { id: 1 });
+    assert_eq!(alice.stats().refused_missing, 1);
 }
 
 #[tokio::test]
@@ -1994,24 +2014,28 @@ async fn every_fetch_holds_sends_to_one_but_only_a_files_read_holds_its_room() {
     // check): one send at a time while it runs, and no room counts as read.
     let fetch = alice.fetching(&address, false);
     let first = alice.inner.start_upload();
-    assert!(first.is_some());
-    assert!(alice.inner.start_upload().is_none());
+    assert!(first.is_ok());
+    assert!(matches!(
+        alice.inner.start_upload(),
+        Err(UploadsTaken::WhileReading)
+    ));
     assert!(room.unread_for(later()) >= ROOM_TURNOVER);
     assert!(alice.inner.active_reads().is_empty());
     drop(first);
     drop(fetch);
     // Nothing fetched: as many sends as any client makes.
-    let sends: Vec<_> = (0..=MAX_UPLOADS)
-        .filter_map(|_| alice.inner.start_upload())
+    let sends: Vec<_> = (0..MAX_UPLOADS)
+        .filter_map(|_| alice.inner.start_upload().ok())
         .collect();
     assert_eq!(sends.len(), MAX_UPLOADS);
+    assert!(matches!(alice.inner.start_upload(), Err(UploadsTaken::All)));
     drop(sends);
     // A read of the file's data record holds its room as well.
     let read = alice.fetching(&address, true);
     assert_eq!(room.unread_for(later()), Duration::ZERO);
     let first = alice.inner.start_upload();
-    assert!(first.is_some());
-    assert!(alice.inner.start_upload().is_none());
+    assert!(first.is_ok());
+    assert!(alice.inner.start_upload().is_err());
     drop(first);
     drop(read);
     assert!(room.unread_for(later()) >= ROOM_TURNOVER);
@@ -2175,4 +2199,431 @@ async fn a_room_asks_the_nodes_nothing_before_its_first_record() {
     let again = tokio::time::Instant::now();
     read.until_started(longest).await;
     assert_eq!(again.elapsed(), Duration::ZERO);
+}
+
+/// What became of a file of some records read by a client whose store holds
+/// only some of them, linked to a reader that then asked it for each.
+#[derive(Debug, PartialEq, Eq)]
+struct ReadThroughFullStore {
+    /// Records the client still holds.
+    held: usize,
+    /// Records the asker's link to it says it holds.
+    offered: usize,
+    /// Records the asker had from it.
+    delivered: usize,
+    /// Reads of the asker's that no link offered the record for.
+    not_offered: u64,
+    /// `Missing` answers the asker had, and the client gave.
+    asks_missing: u64,
+    refused_missing: u64,
+    /// Records a link opened after the read hears of.
+    late: usize,
+}
+
+/// A client whose store holds `held` of a file's `records` records reads
+/// the whole file, linked to another reader, who then reads it too.
+async fn read_through_full_store(records: usize, held: usize) -> ReadThroughFullStore {
+    const LEN: usize = 40_000;
+    let rtc = SharedMemoryRtc::default();
+    let server = Swarm::with_rtc(Some(Arc::new(rtc.clone())), held * LEN + LEN / 2);
+    server.inner.rooms().push(Arc::new(
+        Room::new(ROOM, 1, SECRET).unwrap_or_else(|| panic!("a room")),
+    ));
+    let asker = client(&rtc);
+    let file: Vec<(XorName, Bytes)> = (0..records)
+        .map(|n| record(u8::try_from(n).unwrap_or(u8::MAX), LEN))
+        .collect();
+    let addresses: Vec<XorName> = file.iter().map(|(address, _)| *address).collect();
+    knows(&[&server, &asker], &addresses);
+    link(&rtc, &server, &asker, [7; 16]).await;
+    eventually("the link opens", || asker.stats().links == 1).await;
+    for (address, content) in &file {
+        server.seed(*address, content.clone());
+    }
+    // The asker's view of the server settles on what it holds now.
+    let offered_by = |swarm: &Swarm| {
+        let links = swarm.inner.links();
+        addresses
+            .iter()
+            .filter(|address| links.iter().any(|link| link.has(address)))
+            .count()
+    };
+    let views_match = |swarm: &Swarm| {
+        let links = swarm.inner.links();
+        addresses.iter().all(|address| {
+            links.iter().any(|link| link.has(address)) == server.inner.store.contains(address)
+        })
+    };
+    eventually("the asker hears what the server holds", || {
+        views_match(&asker)
+    })
+    .await;
+    let still_held = addresses
+        .iter()
+        .filter(|address| server.inner.store.contains(address))
+        .count();
+    let offered = offered_by(&asker);
+    let mut delivered = 0;
+    for (address, content) in &file {
+        if let Some(got) = asker.fetch(address).await {
+            assert_eq!(&got, content);
+            delivered += 1;
+        }
+    }
+    let late = client(&rtc);
+    knows(&[&late], &addresses);
+    link(&rtc, &server, &late, [8; 16]).await;
+    eventually("the late link hears what the server holds", || {
+        late.stats().links == 1 && offered_by(&late) == still_held && views_match(&late)
+    })
+    .await;
+    ReadThroughFullStore {
+        held: still_held,
+        offered,
+        delivered,
+        not_offered: asker.stats().reads_not_offered,
+        asks_missing: asker.stats().asks_missing,
+        refused_missing: server.stats().refused_missing,
+        late: offered_by(&late),
+    }
+}
+
+#[tokio::test]
+async fn records_a_full_store_drops_are_taken_back_from_its_links() {
+    // By records, the shapes of a slowed testnet run's reads: a browser's
+    // 64 MiB store holds 16 of a 300 MiB file's 76, a native's 256 MiB 64 of
+    // them, and 64 of a 1000 MB file's 255. Each record kept and later dropped
+    // to make room is taken back: the asker asks only for those still held,
+    // and gets each, with no `Missing` answer either way.
+    for (records, held) in [(76, 16), (76, 64), (255, 64)] {
+        let outcome = read_through_full_store(records, held).await;
+        assert_eq!(
+            outcome,
+            ReadThroughFullStore {
+                held,
+                offered: held,
+                delivered: held,
+                not_offered: u64::try_from(records - held).unwrap_or(u64::MAX),
+                asks_missing: 0,
+                refused_missing: 0,
+                late: held,
+            },
+            "{held} of {records} records held"
+        );
+    }
+}
+
+/// The next `Have` or `Gone` the hand-driven end receives.
+async fn next_offer(channel: &mut Channel) -> Message {
+    loop {
+        let message = next_message(channel).await;
+        if matches!(message, Message::Have { .. } | Message::Gone { .. }) {
+            return message;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_record_dropped_is_taken_back_only_in_its_own_room() {
+    const LEN: usize = 8_000;
+    const OTHER: RoomKey = [8; 32];
+    let rtc = SharedMemoryRtc::default();
+    // Room for two records.
+    let alice = Swarm::with_rtc(Some(Arc::new(rtc.clone())), 2 * LEN + LEN / 2);
+    for key in [ROOM, OTHER] {
+        alice.inner.rooms().push(Arc::new(
+            Room::new(key, 1, SECRET).unwrap_or_else(|| panic!("a room")),
+        ));
+    }
+    let (first, first_content) = record(1, LEN);
+    let (second, second_content) = record(2, LEN);
+    let others: Vec<_> = (3..6).map(|seed| record(seed, LEN)).collect();
+    knows(&[&alice], &[first, second]);
+    alice.register(&OTHER, others.iter().map(|(address, _)| *address));
+    let mut peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+
+    alice.seed(first, first_content);
+    assert_eq!(
+        next_offer(&mut peer).await,
+        Message::Have {
+            addresses: vec![first]
+        }
+    );
+    // Two of the other room's file: the second pushes out this room's record,
+    // and the peer is told.
+    for (address, content) in others.iter().take(2) {
+        alice.seed(*address, content.clone());
+    }
+    assert_eq!(
+        next_offer(&mut peer).await,
+        Message::Gone {
+            addresses: vec![first]
+        }
+    );
+    // Records of the other room's file pushed out are never named here.
+    for (address, content) in others.iter().skip(2) {
+        alice.seed(*address, content.clone());
+    }
+    alice.seed(second, second_content);
+    assert_eq!(
+        next_offer(&mut peer).await,
+        Message::Have {
+            addresses: vec![second]
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_record_a_peer_says_is_gone_is_not_asked_of_it() {
+    let rtc = SharedMemoryRtc::default();
+    let bob = client(&rtc);
+    let peer = hand_driven(&rtc, &bob).await;
+    let (kept, _) = record(1, 10);
+    let (gone, _) = record(2, 10);
+    knows(&[&bob], &[kept, gone]);
+    send(
+        &peer,
+        Message::Have {
+            addresses: vec![kept, gone],
+        },
+    )
+    .await;
+    let offers = |address: &XorName| bob.inner.links().iter().any(|link| link.has(address));
+    eventually("bob learns both", || offers(&kept) && offers(&gone)).await;
+    send(
+        &peer,
+        Message::Gone {
+            addresses: vec![gone],
+        },
+    )
+    .await;
+    eventually("bob forgets the one gone", || !offers(&gone)).await;
+    assert!(offers(&kept));
+    // Its read goes to the nodes without asking the peer.
+    assert_eq!(bob.fetch(&gone).await, None);
+    let stats = bob.stats();
+    assert_eq!((stats.reads_not_offered, stats.asks_missing), (1, 0));
+    // Named again, it is offered again.
+    send(
+        &peer,
+        Message::Have {
+            addresses: vec![gone],
+        },
+    )
+    .await;
+    eventually("bob learns it again", || offers(&gone)).await;
+}
+
+#[tokio::test]
+async fn a_peer_still_reading_sends_as_many_records_at_once_as_it_is_set_to() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let (address, _) = record(4, 100);
+    knows(&[&alice], &[address]);
+    let _reading = alice.fetching(&address, true);
+    alice.set_uploads_while_reading(3);
+    let sends: Vec<_> = (0..3)
+        .filter_map(|_| alice.inner.start_upload().ok())
+        .collect();
+    assert_eq!(sends.len(), 3);
+    assert!(matches!(
+        alice.inner.start_upload(),
+        Err(UploadsTaken::WhileReading)
+    ));
+    drop(sends);
+    // None at all while reading.
+    alice.set_uploads_while_reading(0);
+    assert!(matches!(
+        alice.inner.start_upload(),
+        Err(UploadsTaken::WhileReading)
+    ));
+    // Never more than any client sends.
+    alice.set_uploads_while_reading(99);
+    let sends: Vec<_> = (0..MAX_UPLOADS)
+        .filter_map(|_| alice.inner.start_upload().ok())
+        .collect();
+    assert_eq!(sends.len(), MAX_UPLOADS);
+    assert!(matches!(alice.inner.start_upload(), Err(UploadsTaken::All)));
+}
+
+#[test]
+fn the_uploads_while_reading_setting_is_a_number_of_records() {
+    assert_eq!(uploads_while_reading("4"), Some(4));
+    assert_eq!(uploads_while_reading(" 2\n"), Some(2));
+    assert_eq!(uploads_while_reading("0"), Some(0));
+    for not_a_number in ["", "four", "-1", "1.5"] {
+        assert_eq!(uploads_while_reading(not_a_number), None);
+    }
+}
+
+#[tokio::test]
+async fn a_record_dropped_and_kept_again_is_offered_again() {
+    const LEN: usize = 8_000;
+    let rtc = SharedMemoryRtc::default();
+    // Room for two records.
+    let alice = Swarm::with_rtc(Some(Arc::new(rtc.clone())), 2 * LEN + LEN / 2);
+    alice.inner.rooms().push(Arc::new(
+        Room::new(ROOM, 1, SECRET).unwrap_or_else(|| panic!("a room")),
+    ));
+    let bob = client(&rtc);
+    let records: Vec<_> = (1..4).map(|seed| record(seed, LEN)).collect();
+    let addresses: Vec<XorName> = records.iter().map(|(address, _)| *address).collect();
+    knows(&[&alice, &bob], &addresses);
+    link(&rtc, &alice, &bob, [7; 16]).await;
+    eventually("the link opens", || bob.stats().links == 1).await;
+    // The third pushes out the first; the first, kept again, the second.
+    for (address, content) in records.iter().chain(records.first()) {
+        alice.seed(*address, content.clone());
+    }
+    let offers = |address: &XorName| bob.inner.links().iter().any(|link| link.has(address));
+    eventually("bob hears what alice holds", || {
+        addresses
+            .iter()
+            .all(|address| offers(address) == alice.inner.store.contains(address))
+    })
+    .await;
+    let offered: Vec<bool> = addresses.iter().map(offers).collect();
+    assert_eq!(offered, [true, false, true]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn records_kept_and_dropped_on_many_threads_at_once_leave_each_link_right() {
+    const LEN: usize = 4_096;
+    let rtc = SharedMemoryRtc::default();
+    // Room for four records.
+    let alice = Swarm::with_rtc(Some(Arc::new(rtc.clone())), 4 * LEN + LEN / 2);
+    alice.inner.rooms().push(Arc::new(
+        Room::new(ROOM, 1, SECRET).unwrap_or_else(|| panic!("a room")),
+    ));
+    let bob = client(&rtc);
+    let records: Vec<_> = (0..24).map(|seed| record(seed, LEN)).collect();
+    let addresses: Vec<XorName> = records.iter().map(|(address, _)| *address).collect();
+    knows(&[&alice, &bob], &addresses);
+    link(&rtc, &alice, &bob, [7; 16]).await;
+    eventually("the link opens", || bob.stats().links == 1).await;
+    // Four threads keep the file's records over and over, each in an order
+    // of its own, so records are dropped and kept again at once.
+    let tasks: Vec<_> = (1..=4)
+        .map(|step| {
+            let alice = alice.clone();
+            let records = records.clone();
+            tokio::spawn(async move {
+                for round in 0..20 {
+                    for n in 0..records.len() {
+                        if let Some((address, content)) =
+                            records.get((n * step + round) % records.len())
+                        {
+                            alice.seed(*address, content.clone());
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap_or_else(|e| panic!("{e}"));
+    }
+    eventually("bob hears exactly what alice holds", || {
+        let links = bob.inner.links();
+        addresses.iter().all(|address| {
+            links.iter().any(|link| link.has(address)) == alice.inner.store.contains(address)
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_link_too_far_behind_to_take_back_every_record_is_closed() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let _peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    let link = alice.inner.links().first().cloned();
+    let link = link.unwrap_or_else(|| panic!("no link"));
+    let dropped: Vec<XorName> = (0..=link::MAX_PEER_HAS)
+        .map(|n| {
+            let mut address = [0; 32];
+            if let Some(head) = address.first_chunk_mut::<8>() {
+                *head = u64::try_from(n).unwrap_or(u64::MAX).to_be_bytes();
+            }
+            address
+        })
+        .collect();
+    // More to take back than a peer remembers: none may be left out, so the
+    // link goes rather than leave the peer asking for one.
+    link.retract(&dropped);
+    assert!(link.is_closed());
+}
+
+#[tokio::test]
+async fn a_record_taken_back_while_its_read_waits_is_not_asked_for() {
+    let rtc = SharedMemoryRtc::default();
+    let bob = client(&rtc);
+    let mut peer = hand_driven(&rtc, &bob).await;
+    let (first, first_content) = record(1, 10);
+    let (second, _) = record(2, 10);
+    knows(&[&bob], &[first, second]);
+    send(
+        &peer,
+        Message::Have {
+            addresses: vec![first, second],
+        },
+    )
+    .await;
+    let offers = |address: &XorName| bob.inner.links().iter().any(|link| link.has(address));
+    eventually("bob learns both", || offers(&first) && offers(&second)).await;
+    let link = bob.inner.links().first().cloned();
+    let link = link.unwrap_or_else(|| panic!("no link"));
+    let first_asked = AtomicBool::new(false);
+    let reads = async {
+        let second_read = async {
+            // Behind the first read's ask, on the link's one turn.
+            eventually("the peer has the first ask", || {
+                first_asked.load(Ordering::Acquire)
+            })
+            .await;
+            bob.fetch(&second).await
+        };
+        futures::join!(bob.fetch(&first), second_read)
+    };
+    let script = async {
+        let id = loop {
+            if let Message::Get { id, address } = next_message(&mut peer).await {
+                assert_eq!(address, first);
+                break id;
+            }
+        };
+        first_asked.store(true, Ordering::Release);
+        eventually("the second read waits for its turn", || {
+            link.reads_waiting() == 1
+        })
+        .await;
+        send(
+            &peer,
+            Message::Gone {
+                addresses: vec![second],
+            },
+        )
+        .await;
+        eventually("bob forgets the second", || !link.has(&second)).await;
+        for piece in wire::pieces(id, &first_content) {
+            send(&peer, piece).await;
+        }
+        // Nothing more is asked of the peer.
+        let mut asked_again = false;
+        while let Ok(message) =
+            tokio::time::timeout(Duration::from_millis(300), next_message(&mut peer)).await
+        {
+            asked_again |= matches!(message, Message::Get { .. });
+        }
+        asked_again
+    };
+    let ((first_read, second_read), asked_again) = futures::join!(reads, script);
+    assert_eq!(first_read, Some(first_content));
+    assert_eq!(second_read, None);
+    assert!(!asked_again);
+    let stats = bob.stats();
+    assert_eq!((stats.asks_missing, stats.reads_not_offered), (0, 1));
 }

@@ -1,7 +1,7 @@
 //! One WebRTC link to another client in a room: what it says it holds, the
 //! records this client asked it for, and the records it asked this client for.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
@@ -16,7 +16,8 @@ use super::room::{count, member_key, name_of, signed_by, Room};
 use super::rtc::{ChannelEvent, ChannelSender};
 use super::wire::{self, Assembly, Message, MAX_HAVE_ADDRESSES};
 use super::{
-    or_stopped, spawn, update_usize, Counters, DiscoveryCounters, Inner, Pace, PeerRef, Stop,
+    count_one, or_stopped, spawn, update_usize, Counters, DiscoveryCounters, Inner, Pace, PeerRef,
+    Stop, UploadsTaken,
 };
 use crate::data::XorName;
 
@@ -70,7 +71,7 @@ const MAX_SENDING_PER_LINK: usize = MAX_GETS_PER_LINK + 1;
 /// node, twice over.
 const MAX_ALIASES: usize = 2 * ant_protocol::SWARM_RENDEZVOUS_NODES;
 /// Addresses remembered for what one link holds.
-const MAX_PEER_HAS: usize = 16_384;
+pub(super) const MAX_PEER_HAS: usize = 16_384;
 /// Addresses sent in the first `Have` on a new link.
 pub(super) const INITIAL_HAVE: usize = 4096;
 /// Messages waiting to be sent on one link before it is dropped.
@@ -86,9 +87,14 @@ pub(super) enum GetOutcome {
     /// The peer has it but is busy, or this link has as many asks in flight
     /// as it may.
     Busy,
-    /// This link has as many reads asking and waiting as it takes: the read
+    /// This link has as many reads asking and waiting as it takes, or took
+    /// none before the read's time ran out: nothing was asked, and the read
     /// goes elsewhere.
     Full,
+    /// Once the read's turn came, the link no longer offered the record (the
+    /// peer took it back, answered `Missing` for it to another read, or was
+    /// lately too slow): nothing was asked.
+    NotOffered,
     /// The link failed, or the record did not arrive in time.
     Failed,
 }
@@ -119,8 +125,7 @@ struct State {
     /// `Proof` showed it holds that key: an unproven link has no name, and
     /// so settles no duplicate.
     peer_nonce: Option<[u8; 16]>,
-    has: HashSet<XorName>,
-    has_order: VecDeque<XorName>,
+    has: PeerHas,
     gets: HashMap<u32, Get>,
     next_get: u32,
     /// The peer's asks being answered, by id, each with its transfer's
@@ -139,10 +144,64 @@ struct State {
     slow_until: Option<Instant>,
 }
 
+/// What the peer on a link says it holds: the newest [`MAX_PEER_HAS`]
+/// addresses its `Have`s named, less those it said are gone or answered
+/// `Missing` for. Each costs the same to add or take out, however the peer
+/// mixes its `Have`s and `Gone`s.
+#[derive(Default)]
+struct PeerHas {
+    /// Each address held, with the number its newest naming was given.
+    addresses: HashMap<XorName, u64>,
+    /// Those namings, oldest first. One whose address went since, or was
+    /// named again under a newer number, is passed over, and swept out once
+    /// as many such are kept as live ones may be.
+    order: VecDeque<(XorName, u64)>,
+    next: u64,
+}
+
+impl PeerHas {
+    fn contains(&self, address: &XorName) -> bool {
+        self.addresses.contains_key(address)
+    }
+
+    /// Notes that the peer holds `address`; past [`MAX_PEER_HAS`], the one
+    /// it named longest ago is forgotten.
+    fn add(&mut self, address: XorName) {
+        if self.addresses.contains_key(&address) {
+            return;
+        }
+        let number = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.addresses.insert(address, number);
+        self.order.push_back((address, number));
+        while self.addresses.len() > MAX_PEER_HAS {
+            let Some((oldest, named)) = self.order.pop_front() else {
+                break;
+            };
+            if self.addresses.get(&oldest) == Some(&named) {
+                self.addresses.remove(&oldest);
+            }
+        }
+        if self.order.len() > 2 * MAX_PEER_HAS {
+            let addresses = &self.addresses;
+            self.order
+                .retain(|(address, named)| addresses.get(address) == Some(named));
+        }
+    }
+
+    /// Notes that the peer no longer holds `address`.
+    fn remove(&mut self, address: &XorName) {
+        self.addresses.remove(address);
+    }
+}
+
 #[derive(Default)]
 struct Outbox {
     control: VecDeque<Message>,
     haves: Vec<XorName>,
+    /// Records announced, or that may have been, and dropped since: never
+    /// also among `haves`, so the peer hears the newest of the two.
+    gones: Vec<XorName>,
 }
 
 /// A link to one other client in one room.
@@ -264,6 +323,12 @@ impl Link {
         self.state().has.contains(address)
     }
 
+    /// Reads waiting for a turn to ask this link.
+    #[cfg(test)]
+    pub(super) fn reads_waiting(&self) -> usize {
+        self.waiting.load(Ordering::Acquire)
+    }
+
     pub(super) fn peer_nonce(&self) -> Option<[u8; 16]> {
         self.state().peer_nonce
     }
@@ -368,9 +433,35 @@ impl Link {
     pub(super) fn announce(&self, addresses: &[XorName]) {
         {
             let mut outbox = self.outbox.lock().unwrap_or_else(PoisonError::into_inner);
+            if !outbox.gones.is_empty() {
+                outbox.gones.retain(|address| !addresses.contains(address));
+            }
             outbox.haves.extend_from_slice(addresses);
             let excess = outbox.haves.len().saturating_sub(MAX_PEER_HAS);
             outbox.haves.drain(..excess);
+        }
+        self.wake.notify_one();
+    }
+
+    /// Tells the peer that records this client announced, or may have, are
+    /// no longer held: dropped from the store to make room. Without this the
+    /// peer would go on asking for them, and be answered `Missing` each time.
+    /// A link with more than [`MAX_PEER_HAS`] of them still unsent is closed,
+    /// as one whose other messages back up is: leaving any out would leave
+    /// the peer asking for a record gone.
+    pub(super) fn retract(&self, addresses: &[XorName]) {
+        if addresses.is_empty() {
+            return;
+        }
+        let behind = {
+            let mut outbox = self.outbox.lock().unwrap_or_else(PoisonError::into_inner);
+            outbox.haves.retain(|address| !addresses.contains(address));
+            outbox.gones.extend_from_slice(addresses);
+            outbox.gones.len() > MAX_PEER_HAS
+        };
+        if behind {
+            self.close();
+            return;
         }
         self.wake.notify_one();
     }
@@ -400,14 +491,15 @@ impl Link {
                     or_stopped(&self.closed, Arc::clone(&self.asking).acquire_owned()),
                 )
                 .await;
-                let Ok(Some(Ok(turn))) = turn else {
-                    return GetOutcome::Failed;
-                };
-                turn
+                match turn {
+                    Ok(Some(Ok(turn))) => turn,
+                    Err(_) => return GetOutcome::Full,
+                    Ok(_) => return GetOutcome::Failed,
+                }
             }
         };
         if !self.offers(&address) {
-            return GetOutcome::Missing;
+            return GetOutcome::NotOffered;
         }
         let (sender, mut events) = mpsc::unbounded();
         let id = {
@@ -610,8 +702,11 @@ impl Link {
         DiscoveryCounters::add(&inner.discovery.links_proven, 1);
         self.state().open = true;
         inner.settle_duplicates(&self);
-        // Only the records of this link's room's file.
+        // Only the records of this link's room's file, listed and announced
+        // in one turn with the store's changes: a record dropped meanwhile is
+        // either left out here or taken back after.
         if let Some(room) = inner.room(&self.room) {
+            let _publishing = inner.publishing();
             self.announce(
                 &inner
                     .store
@@ -656,14 +751,14 @@ impl Link {
             Message::Have { addresses } => {
                 let mut state = self.state();
                 for address in addresses {
-                    if state.has.insert(address) {
-                        state.has_order.push_back(address);
-                    }
+                    state.has.add(address);
                 }
-                while state.has_order.len() > MAX_PEER_HAS {
-                    if let Some(oldest) = state.has_order.pop_front() {
-                        state.has.remove(&oldest);
-                    }
+                true
+            }
+            Message::Gone { addresses } => {
+                let mut state = self.state();
+                for address in &addresses {
+                    state.has.remove(address);
                 }
                 true
             }
@@ -680,11 +775,7 @@ impl Link {
             Message::Missing { id } => {
                 let mut state = self.state();
                 if let Some(get) = state.gets.remove(&id) {
-                    // Out of the queue too, so a later `Have` of it is not
-                    // undone by the stale entry.
-                    if state.has.remove(&get.address) {
-                        state.has_order.retain(|address| *address != get.address);
-                    }
+                    state.has.remove(&get.address);
                     let _ = get.events.unbounded_send(GetEvent::Missing);
                 }
                 true
@@ -752,7 +843,9 @@ impl Link {
         } else {
             None
         };
+        let counters = Arc::clone(&inner.counters);
         let Some(record) = record else {
+            count_one(&counters.refused_missing);
             self.queue(Message::Missing { id });
             return;
         };
@@ -769,6 +862,7 @@ impl Link {
             }
         };
         let Some(number) = number else {
+            count_one(&counters.refused_busy_link);
             self.queue(Message::Busy { id });
             return;
         };
@@ -778,14 +872,20 @@ impl Link {
             id,
             number,
         };
-        // One record at a time while this client's own reads run: its
+        // Fewer records at once while this client's own reads run: its
         // download needs the CPU and line a record sent takes.
-        let Some(permit) = inner.start_upload() else {
-            drop(transfer);
-            self.queue(Message::Busy { id });
-            return;
+        let permit = match inner.start_upload() {
+            Ok(permit) => permit,
+            Err(taken) => {
+                drop(transfer);
+                count_one(match taken {
+                    UploadsTaken::WhileReading => &counters.refused_busy_reading,
+                    UploadsTaken::All => &counters.refused_busy_uploads,
+                });
+                self.queue(Message::Busy { id });
+                return;
+            }
         };
-        let counters = Arc::clone(&inner.counters);
         let room_counters = Arc::clone(&self.room_counters);
         drop(inner);
         let link = Arc::clone(self);
@@ -838,32 +938,39 @@ impl Link {
     }
 
     /// Sends queued messages until the link closes, gathering the addresses
-    /// waiting to be announced into as few `Have` messages as fit.
+    /// waiting to be taken back or announced into as few `Gone` and `Have`
+    /// messages as fit.
     async fn write(self: Arc<Self>) {
         loop {
             let notified = self.wake.notified();
-            let (control, haves) = {
+            let (control, gones, haves) = {
                 let mut outbox = self.outbox.lock().unwrap_or_else(PoisonError::into_inner);
                 (
                     std::mem::take(&mut outbox.control),
+                    std::mem::take(&mut outbox.gones),
                     std::mem::take(&mut outbox.haves),
                 )
             };
             if self.closed.is_stopped() {
                 return;
             }
-            if control.is_empty() && haves.is_empty() {
+            if control.is_empty() && gones.is_empty() && haves.is_empty() {
                 if or_stopped(&self.closed, notified).await.is_none() {
                     return;
                 }
                 continue;
             }
+            let gones = gones
+                .chunks(MAX_HAVE_ADDRESSES)
+                .map(|addresses| Message::Gone {
+                    addresses: addresses.to_vec(),
+                });
             let haves = haves
                 .chunks(MAX_HAVE_ADDRESSES)
                 .map(|addresses| Message::Have {
                     addresses: addresses.to_vec(),
                 });
-            for message in control.into_iter().chain(haves) {
+            for message in control.into_iter().chain(gones).chain(haves) {
                 // A peer that stops reading would hold the writer for ever.
                 let sent =
                     crate::runtime::timeout(SEND_DEADLINE, self.send(message.encode())).await;
@@ -1016,5 +1123,50 @@ impl Drop for GetGuard<'_> {
         if removed && !self.link.is_closed() {
             self.link.queue(Message::Cancel { id: self.id });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn address(n: usize) -> XorName {
+        let mut address = [0; 32];
+        if let Some(head) = address.first_chunk_mut::<8>() {
+            *head = u64::try_from(n).unwrap_or(u64::MAX).to_be_bytes();
+        }
+        address
+    }
+
+    #[test]
+    fn a_peer_holds_its_newest_named_records_less_those_it_took_back() {
+        let mut has = PeerHas::default();
+        for n in 0..=MAX_PEER_HAS {
+            has.add(address(n));
+        }
+        // Past the limit, the one named longest ago goes.
+        assert!(!has.contains(&address(0)));
+        assert!(has.contains(&address(1)));
+        assert!(has.contains(&address(MAX_PEER_HAS)));
+        has.remove(&address(1));
+        assert!(!has.contains(&address(1)));
+        // Named again, it is held as newly named: its first naming, still
+        // queued, does not push it out early.
+        has.add(address(1));
+        has.add(address(MAX_PEER_HAS + 1));
+        assert!(has.contains(&address(1)));
+        assert!(!has.contains(&address(2)));
+        assert_eq!(has.addresses.len(), MAX_PEER_HAS);
+    }
+
+    #[test]
+    fn a_peer_naming_and_taking_back_records_over_and_over_costs_bounded_room() {
+        let mut has = PeerHas::default();
+        for n in 0..5 * MAX_PEER_HAS {
+            has.add(address(n % 7));
+            assert!(has.order.len() <= 2 * MAX_PEER_HAS);
+            has.remove(&address(n % 7));
+        }
+        assert!(has.addresses.is_empty());
     }
 }
