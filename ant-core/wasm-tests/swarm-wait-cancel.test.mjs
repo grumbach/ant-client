@@ -152,3 +152,54 @@ test("a read aborted as its record arrives does not have its waiting join made",
   assert.deepEqual(cancelled.filter(([, , joined]) => joined), [],
     "no cancelled read's waiting join is made, whenever it aborts after its record arrives");
 });
+
+// A streaming read starts read-ahead tasks for the records after its own,
+// and a record's fetch starting makes a waiting join for its file. Aborted
+// from a microtask right after its first poll, once the rooms have gone
+// unread, the read's own task runs after those tasks: its hold must already
+// be let go of, by the abort itself.
+test("a streaming read aborted before its read-ahead starts lets go of its waiting join", async () => {
+  const slow = new Set(files[0].chunks.map(record => record.address));
+  const abort = new AbortController();
+  const reason = new Error("cancelled before its read-ahead started");
+  let armed = false;
+  // The first file's records never come: its read waits on them.
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({
+    respond(_channel, method) {
+      if (armed && method === "get_chunk" && slow.has(rtc.requests.at(-1)?.address)) return false;
+    },
+  })));
+  for (const store of rtc.stores) {
+    for (const { encrypted } of files) for (const record of encrypted.records) store.set(record.address, record.content);
+  }
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const readers = [];
+  const tags = [];
+  const open = async ({ datamap }, streaming) => {
+    let tag;
+    readers.push(await client.openPublicFile(datamap.address, message => { tag ??= roomMessage(message); }, { streaming }));
+    tags.push(tag);
+  };
+  const joined = () => client.swarmRoomStats().map(room => room.tag);
+  try {
+    await open(files[0], true);
+    for (const file of files.slice(1, 4)) await open(file, false);
+    skipTurnover();
+    await open(files[4], false);
+    assert.ok(!joined().includes(tags[0]), "the fifth file's room took the first one's place");
+    for (const reader of readers.slice(1)) await reader.readRange(0, 10);
+    await settle();
+    armed = true;
+    const read = readers[0].readRange(0, 10, { signal: abort.signal });
+    queueMicrotask(() => {
+      skipTurnover();
+      abort.abort(reason);
+    });
+    await assert.rejects(read, error => error === reason);
+    await settle();
+    assert.ok(!joined().includes(tags[0]), "the cancelled read's waiting join is not made");
+  } finally {
+    for (const reader of readers) reader.close();
+    client.close();
+  }
+});

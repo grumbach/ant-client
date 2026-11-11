@@ -2481,16 +2481,6 @@ struct ResolvedBrowserFile {
     room: Option<(RoomKey, [u8; 32])>,
 }
 
-/// Keeps a read's `hold` on a join it made wait, unless the read's signal
-/// has aborted: a cancelled read lets go of it (see [`JoinHold`]).
-fn keep_unless_cancelled(hold: Option<JoinHold>, cancel: &download::Cancellation) {
-    if cancel.check().is_ok() {
-        if let Some(hold) = hold {
-            hold.keep();
-        }
-    }
-}
-
 /// The records of the file `index` covers, as its room shares them.
 fn swarm_records(index: &self_encryption::DataMapIndex) -> impl Iterator<Item = XorName> + '_ {
     index.infos().iter().map(|info| info.dst_hash.0)
@@ -3166,7 +3156,10 @@ impl BrowserNetworkClient {
                     .map_err(|error| JsValue::from_str(&error))
             })
             .await?;
-        let hold = self.join_file_room(&resolved, &progress, &cancel)?;
+        let hold = download::HeldJoin::new(
+            self.join_file_room(&resolved, &progress, &cancel)?,
+            &cancel.probe(),
+        );
         progress.report(&format!(
             "Ready to stream {} ({} bytes, {} chunks)",
             resolved.file.name,
@@ -3176,7 +3169,7 @@ impl BrowserNetworkClient {
         // The report may have aborted the open: it then returns no reader and
         // lets go of a join it made wait.
         cancel.check()?;
-        keep_unless_cancelled(hold, &cancel);
+        hold.keep();
         Ok(BrowserFileReader::new(
             Rc::clone(&self.shared),
             resolved,
@@ -3200,7 +3193,10 @@ impl BrowserNetworkClient {
                     .map_err(|error| JsValue::from_str(&error))
             })
             .await?;
-        let hold = self.join_file_room(&resolved, &settings.progress, &cancel)?;
+        let hold = download::HeldJoin::new(
+            self.join_file_room(&resolved, &settings.progress, &cancel)?,
+            &cancel.probe(),
+        );
         let collected =
             download::collect(&self.shared, &resolved.index, &settings, &mut cancel).await;
         let result = collected.and_then(|(content, hash)| {
@@ -3218,8 +3214,8 @@ impl BrowserNetworkClient {
             })
         });
         // A download that ended, whether it read the file or failed, keeps a
-        // join it made wait, as a plain read does; one cancelled lets go.
-        keep_unless_cancelled(hold, &cancel);
+        // join it made wait, as a plain read does; its abort let go of it.
+        hold.keep();
         result
     }
 
@@ -3301,8 +3297,8 @@ impl BrowserNetworkClient {
     /// and says so in the read's `progress`, unless the read's signal has
     /// aborted. The signal is checked after that progress callback, which may
     /// abort it, and nothing yields between the check and the join. Returns
-    /// the read's hold on the join if it waits for a room to make way: the
-    /// read keeps it when it ends uncancelled (see [`keep_unless_cancelled`]).
+    /// the read's hold on the join if it waits for a room to make way (see
+    /// [`download::HeldJoin`]).
     fn join_file_room(
         &self,
         resolved: &ResolvedBrowserFile,

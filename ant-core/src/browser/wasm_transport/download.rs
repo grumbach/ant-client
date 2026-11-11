@@ -158,11 +158,27 @@ impl DownloadSettings {
     }
 }
 
+/// What an operation must undo the moment its signal aborts, inside the
+/// `abort` event itself: before any task runs, the operation's own included,
+/// which the abort only wakes.
+#[derive(Default)]
+struct AbortActions(RefCell<Vec<Box<dyn FnOnce()>>>);
+
+impl AbortActions {
+    fn run(&self) {
+        let actions = std::mem::take(&mut *self.0.borrow_mut());
+        for action in actions {
+            action();
+        }
+    }
+}
+
 /// An AbortSignal's `abort` event. Detaches its listener when dropped.
 struct AbortListener {
     signal: AbortSignal,
     callback: Closure<dyn FnMut()>,
     fired: oneshot::Receiver<()>,
+    actions: Rc<AbortActions>,
 }
 
 impl AbortListener {
@@ -172,16 +188,20 @@ impl AbortListener {
             .map_err(|_| JsValue::from_str(NOT_ABORT_SIGNAL))?;
         let (sender, fired) = oneshot::channel();
         let mut sender = Some(sender);
+        let actions = Rc::<AbortActions>::default();
+        let on_abort = Rc::clone(&actions);
         let callback = Closure::<dyn FnMut()>::new(move || {
             if let Some(sender) = sender.take() {
                 let _ = sender.send(());
             }
+            on_abort.run();
         });
         signal.add_event_listener_with_callback(ABORT_EVENT, callback.as_ref().unchecked_ref())?;
         Ok(Self {
             signal,
             callback,
             fired,
+            actions,
         })
     }
 
@@ -229,7 +249,11 @@ impl Cancellation {
     /// A handle on the signal for the operation's own callbacks, which run in
     /// the middle of one of its polls and may abort it there.
     pub(super) fn probe(&self) -> AbortProbe {
-        AbortProbe(self.0.as_ref().map(|listener| listener.signal.clone()))
+        AbortProbe(
+            self.0
+                .as_ref()
+                .map(|listener| (listener.signal.clone(), Rc::clone(&listener.actions))),
+        )
     }
 
     /// Run `operation` unless the signal aborts first. The signal is polled
@@ -269,20 +293,52 @@ impl Cancellation {
 /// is followed by a look here, so the operation stops before its next record,
 /// write or close.
 #[derive(Clone)]
-pub(super) struct AbortProbe(Option<AbortSignal>);
+pub(super) struct AbortProbe(Option<(AbortSignal, Rc<AbortActions>)>);
 
 impl AbortProbe {
     /// Whether the signal has aborted.
     pub(super) fn aborted(&self) -> bool {
-        self.0.as_ref().is_some_and(AbortSignal::aborted)
+        self.0.as_ref().is_some_and(|(signal, _)| signal.aborted())
+    }
+
+    /// Runs `action` the moment the signal aborts, inside its `abort` event,
+    /// or now if it has aborted already. Without a signal it never runs.
+    fn on_abort(&self, action: impl FnOnce() + 'static) {
+        let Some((signal, actions)) = &self.0 else {
+            return;
+        };
+        if signal.aborted() {
+            action();
+        } else {
+            actions.0.borrow_mut().push(Box::new(action));
+        }
     }
 }
 
-/// Keeps a read's `hold` on a join it made wait once the read has ended,
-/// unless its signal aborted: a read dropped part-way, as a cancelled one
-/// is, never gets here and lets go of it (see [`JoinHold`]).
-fn keep_unless_aborted(hold: Option<JoinHold>, probe: &AbortProbe) {
-    if !probe.aborted() {
+/// A read's hold on a join it made wait (see [`JoinHold`]). The read keeps
+/// it when it ends. Its signal aborting lets go of it at once, inside the
+/// `abort` event: the read's own task, which the abort wakes, may run only
+/// after tasks queued before it, such as read-ahead fetches, whose start
+/// would otherwise still find the wait held, and make it.
+pub(super) struct HeldJoin(Rc<RefCell<Option<JoinHold>>>);
+
+impl HeldJoin {
+    pub(super) fn new(hold: Option<JoinHold>, probe: &AbortProbe) -> Self {
+        let held = Rc::new(RefCell::new(hold));
+        if held.borrow().is_some() {
+            let on_abort = Rc::clone(&held);
+            probe.on_abort(move || {
+                let hold = on_abort.borrow_mut().take();
+                drop(hold);
+            });
+        }
+        Self(held)
+    }
+
+    /// The read ended, whatever it found: it keeps the wait, unless its
+    /// signal aborted, which let go of it.
+    pub(super) fn keep(self) {
+        let hold = self.0.borrow_mut().take();
         if let Some(hold) = hold {
             hold.keep();
         }
@@ -508,7 +564,7 @@ impl BrowserFileReader {
         // The signal is checked before the read's first poll, which joins.
         cancel
             .run(async {
-                let hold = self.join_room();
+                let hold = HeldJoin::new(self.join_room(), &probe);
                 let lease = self.read_ahead.begin_read(start, length as usize);
                 let bytes = self
                     .shared
@@ -517,7 +573,7 @@ impl BrowserFileReader {
                     })
                     .await;
                 lease.finish();
-                keep_unless_aborted(hold, &probe);
+                hold.keep();
                 if matches!(bytes, Err(crate::data::Error::Encryption(_))) {
                     // The records do not decrypt as the DataMap declares, so
                     // reading further ahead would only spend bandwidth and
@@ -604,8 +660,8 @@ impl BrowserFileReader {
 
     /// Joins the file's room again as a read starts, if reading other files
     /// has left it since the file was opened, which joined it. Returns the
-    /// read's hold on the join if it waits for a room to make way: the read
-    /// keeps it when it ends uncancelled (see [`keep_unless_aborted`]).
+    /// read's hold on the join if it waits for a room to make way (see
+    /// [`HeldJoin`]).
     fn join_room(&self) -> Option<JoinHold> {
         let (room, secret) = self.room?;
         self.shared
@@ -662,7 +718,7 @@ impl BrowserFileReader {
         let probe = &cancel.probe();
         cancel
             .run(async {
-                let hold = self.join_room();
+                let hold = HeldJoin::new(self.join_room(), probe);
                 let streamed = stream_chunks(
                     &self.shared,
                     &self.index,
@@ -703,7 +759,7 @@ impl BrowserFileReader {
                     Ok(()) => JsFuture::from(writer.close()).await.map(drop),
                     Err(error) => Err(error),
                 };
-                keep_unless_aborted(hold, probe);
+                hold.keep();
                 closed
             })
             .await?;
