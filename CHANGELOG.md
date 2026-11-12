@@ -38,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so readers asking little or reading slowly do not make it forget its line, and after every 8 s
   of sending, one more place for 2 s tries whether the line carries more. A send holds its place
   until its channel is empty, or its reader asks again, or the page is hidden (a hidden page's
-  timers are slowed). Nodes stay the last seed, and nodes
+  timers are slowed); 20 s after it began, a channel still sending gives its place back, and one
+  that has let nothing out for 6 s ends its link. Nodes stay the last seed, and nodes
   without swarm rooms are read as before. A record a client drops from its store to make room is
   taken back from the readers it was announced to, so they stop asking it for that record. Each client asks for a file's records
   in an order of its own, the same for each of its downloads; a native download, which writes

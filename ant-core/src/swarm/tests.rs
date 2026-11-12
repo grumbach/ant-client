@@ -6,12 +6,13 @@ use futures::StreamExt;
 use self_encryption::{ChunkInfo, XorName as ChunkName};
 use web_time::Instant;
 
-use super::link::FETCH_STALL;
+use super::link::{DRAIN_STALL, FETCH_STALL, SEND_DEADLINE};
 use super::room::{name_of, Identity};
 use super::rtc::memory::SharedMemoryRtc;
 use super::rtc::{Channel, ChannelEvent};
 use super::wire::Message;
 use super::*;
+use crate::runtime::Clock;
 
 const ROOM: RoomKey = [9; 32];
 /// The test room's secret, as every reader of its file derives it.
@@ -2832,6 +2833,128 @@ async fn a_send_keeps_its_place_until_its_bytes_leave_the_channel_or_its_peer_as
     })
     .await;
     assert_eq!(alice.stats().refused_busy_uploads, 1);
+}
+
+/// The one link `swarm` has.
+fn only_link(swarm: &Swarm) -> Arc<Link> {
+    let link = swarm.inner.links().first().cloned();
+    link.unwrap_or_else(|| panic!("no link"))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_link_still_sending_others_messages_past_a_sends_deadline_stays_open() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let mut peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    let link = only_link(&alice);
+    let (address, content) = record(1, 3 * wire::FRAME_BYTES);
+    let others: Vec<_> = (2..32).map(|seed| record(seed, 100)).collect();
+    let mut addresses = vec![address];
+    addresses.extend(others.iter().map(|(other, _)| *other));
+    knows(&[&alice], &addresses);
+    alice.seed(address, content);
+    assert_eq!(
+        next_offer(&mut peer).await,
+        Message::Have {
+            addresses: vec![address]
+        }
+    );
+    // From here on the channel always holds its last 10 bytes: it never
+    // empties, but what is handed to it leaves.
+    rtc.0.unsent.store(10, Ordering::Release);
+    let started = Clock::now();
+    send(&peer, Message::Get { id: 0, address }).await;
+    whole_record(&mut peer, 0).await;
+    assert_eq!(alice.inner.upload_limit.running(), 1);
+    // The record is all sent; a `Have` a second keeps the channel busy, and
+    // leaving it, until well past the record's deadline.
+    for (other, content) in others {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        alice.seed(other, content);
+        assert_eq!(
+            next_offer(&mut peer).await,
+            Message::Have {
+                addresses: vec![other]
+            }
+        );
+        if started.elapsed() < SEND_DEADLINE {
+            assert_eq!(alice.inner.upload_limit.running(), 1);
+        }
+    }
+    assert!(started.elapsed() > SEND_DEADLINE + DRAIN_STALL);
+    // A channel still sending gives the place back and keeps its link.
+    assert!(!link.is_closed());
+    assert_eq!(alice.stats().links, 1);
+    assert_eq!(alice.inner.upload_limit.running(), 0);
+    // Once it empties, nothing more leaving it is no stall.
+    rtc.0.unsent.store(0, Ordering::Release);
+    tokio::time::sleep(2 * DRAIN_STALL).await;
+    assert!(!link.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_stops_reading_just_before_a_sends_deadline_still_loses_its_link() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let mut peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    let link = only_link(&alice);
+    let (address, content) = record(1, 3 * wire::FRAME_BYTES);
+    knows(&[&alice], &[address]);
+    alice.seed(address, content);
+    next_offer(&mut peer).await;
+    // The record's last 1000 bytes stay in the channel.
+    rtc.0.unsent.store(1000, Ordering::Release);
+    let started = Clock::now();
+    send(&peer, Message::Get { id: 0, address }).await;
+    whole_record(&mut peer, 0).await;
+    // The peer reads a little more a second before the deadline, then
+    // nothing.
+    let read_last = started + SEND_DEADLINE - Duration::from_secs(1);
+    tokio::time::sleep_until(read_last).await;
+    rtc.0.unsent.store(500, Ordering::Release);
+    // Past the deadline the channel was still sending: the place goes back,
+    // and the link stays.
+    tokio::time::sleep_until(started + SEND_DEADLINE + Duration::from_millis(100)).await;
+    assert!(!link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 0);
+    // Watched on, the channel lets nothing out for as long as a channel may
+    // stay quiet: the link goes.
+    tokio::time::sleep_until(read_last + DRAIN_STALL - Duration::from_millis(200)).await;
+    assert!(!link.is_closed());
+    tokio::time::sleep_until(read_last + DRAIN_STALL + Duration::from_millis(300)).await;
+    assert!(link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_stops_reading_loses_its_link_past_a_sends_deadline() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let mut peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    let link = only_link(&alice);
+    let (address, content) = record(1, 3 * wire::FRAME_BYTES);
+    knows(&[&alice], &[address]);
+    alice.seed(address, content);
+    next_offer(&mut peer).await;
+    // The record's last 1000 bytes stay in the channel.
+    rtc.0.unsent.store(1000, Ordering::Release);
+    let started = Clock::now();
+    send(&peer, Message::Get { id: 0, address }).await;
+    whole_record(&mut peer, 0).await;
+    // The peer reads a little more, then nothing.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    rtc.0.unsent.store(500, Ordering::Release);
+    tokio::time::sleep(SEND_DEADLINE - started.elapsed() - Duration::from_millis(100)).await;
+    assert!(!link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 1);
+    // Past the deadline, nothing has left the channel for longer than a
+    // channel may stay quiet.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 0);
 }
 
 #[tokio::test]

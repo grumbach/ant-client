@@ -21,6 +21,7 @@ use super::{
     Stop,
 };
 use crate::data::XorName;
+use crate::runtime::Clock;
 
 /// How long a new link may take to open.
 pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -45,6 +46,13 @@ const SETTLE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// than any asker waits for it.
 pub(super) const SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 const _: () = assert!(SEND_DEADLINE.as_secs() > FETCH_TOTAL.as_secs());
+/// How long a channel may let nothing out, past a send's deadline, before
+/// its peer counts as having stopped reading. The channel carries every
+/// message of the link, so one still holding bytes then may be busy rather
+/// than stuck: twice the 3 s an SCTP sender waits to send a lost chunk again
+/// before it has timed a round trip (webrtc-rs, RFC 4960), so a lossy link
+/// that still reads is not taken for one that stopped.
+pub(super) const DRAIN_STALL: std::time::Duration = std::time::Duration::from_secs(6);
 /// Pieces of one record sent before it lets others have the channel: at 16
 /// KiB each, a record waits at most 64 KiB behind another's.
 pub(super) const PIECES_PER_TURN: usize = 4;
@@ -79,6 +87,9 @@ pub(super) const INITIAL_HAVE: usize = 4096;
 const MAX_OUTBOX: usize = 1024;
 /// How often a sent record looks whether the channel has emptied.
 const SENT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+/// How often a send that gave its place back looks whether the channel it
+/// watches has emptied or stalled.
+const WATCH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// What became of one record asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -262,6 +273,9 @@ pub(super) struct Link {
     /// each holding its place among the client's sends.
     draining: Mutex<Drains>,
     next_draining: AtomicU64,
+    /// Whether a send that gave its place back watches the channel for a
+    /// stall (see [`Link::until_empty`]).
+    watching: AtomicBool,
 }
 
 /// The records a link still drains, and how many asks the peer has made.
@@ -324,6 +338,7 @@ impl Link {
             counted: AtomicU64::new(0),
             draining: Mutex::default(),
             next_draining: AtomicU64::new(0),
+            watching: AtomicBool::new(false),
         })
     }
 
@@ -924,7 +939,7 @@ impl Link {
         spawn(async move {
             let slot = slot;
             let transfer = transfer;
-            let started = Instant::now();
+            let started = Clock::now();
             // A peer that stops reading would hold the send, and its upload
             // slot, for ever: past the deadline the link goes.
             let sending = async {
@@ -975,8 +990,9 @@ impl Link {
                 return;
             }
             // The place is held until the channel holds nothing more, or the
-            // peer asks again, which means the record reached it: if it has
-            // asked again already, the place goes now.
+            // peer asks again, which means the record reached it, or past
+            // the deadline the channel is still sending (and is watched on):
+            // if it has asked again already, the place goes now.
             let number = link.next_draining.fetch_add(1, Ordering::Relaxed);
             if !link.hold_until_sent(number, asked, slot) {
                 return;
@@ -993,10 +1009,10 @@ impl Link {
             };
             link.drained(number);
             if drain == Drain::Stalled {
-                // Bytes still not gone past the deadline, with nothing newer
-                // asked of the link: a peer that stopped reading, which ends
-                // the link as a send that stalls does (already stopped when
-                // the stall was found).
+                // Past the deadline, nothing has left the channel for a
+                // while: a peer that stopped reading, which ends the link as
+                // a send that stalls does (already stopped when the stall
+                // was found).
                 link.close();
             }
         });
@@ -1045,10 +1061,10 @@ impl Link {
         true
     }
 
-    /// Whether the draining record `number`, past its deadline, still holds
-    /// its place: if so the link stops, in the same step, so a peer asking
-    /// again at that moment either retires it first or finds the link
-    /// stopped.
+    /// Whether the draining record `number`, past its deadline with its
+    /// channel letting nothing out, still holds its place: if so the link
+    /// stops, in the same step, so a peer asking again at that moment either
+    /// retires it first or finds the link stopped.
     fn stalled(&self, number: u64) -> Drain {
         let mut drains = self.drains();
         let Some(position) = drains
@@ -1080,41 +1096,95 @@ impl Link {
         drop(freed);
     }
 
+    /// Whether the draining record `number` still holds its place.
+    fn holds(&self, number: u64) -> bool {
+        self.drains()
+            .records
+            .iter()
+            .any(|draining| draining.number == number)
+    }
+
     /// Waits until the channel holds nothing unsent, while the draining
-    /// record `number` still holds its place: by `by`, or it stalled.
-    /// Natively a channel can have its later bytes acknowledged before
-    /// earlier ones are sent again, so only an empty channel tells that a
-    /// record has left it whole.
-    async fn until_empty(&self, number: u64, by: Instant) -> Drain {
+    /// record `number` still holds its place. Natively a channel can have
+    /// its later bytes acknowledged before earlier ones are sent again, so
+    /// only an empty channel tells that a record has left it whole.
+    ///
+    /// The channel holds every message of the link, not only this record's,
+    /// so one not empty by `by` has stalled only once nothing has left it
+    /// for [`DRAIN_STALL`]. One still sending then, behind other messages or
+    /// to a slow reader, gives the place back and keeps the link, and is
+    /// watched on until it empties: a peer that stops reading later still
+    /// loses the link. One send at a time watches a link's channel so.
+    async fn until_empty(&self, number: u64, by: Clock) -> Drain {
+        let (mut gone, _) = self.channel_bytes().await;
+        // When bytes last left the channel, once any have; until then, when
+        // this began watching it.
+        let mut quiet_since = Clock::now();
+        let mut moved = false;
+        // Once the place is given back, this send's turn to watch the
+        // channel.
+        let mut watch: Option<Watch<'_>> = None;
         loop {
-            let unsent = self.sender.unsent().await;
-            let now = Instant::now();
-            if self.is_closed() {
+            let (left, unsent) = self.channel_bytes().await;
+            let now = Clock::now();
+            if self.is_closed() || unsent == 0 {
                 return Drain::Ended;
             }
-            let held = self
-                .drains()
-                .records
-                .iter()
-                .any(|draining| draining.number == number);
-            // Its peer asked again: it has the record, and what the channel
-            // still holds is no longer this send's.
-            if !held || unsent == 0 {
+            // Its peer asked again while it held its place: it has the
+            // record, and what the channel still holds is no longer this
+            // send's.
+            if watch.is_none() && !self.holds(number) {
                 return Drain::Ended;
             }
-            if now > by {
-                return self.stalled(number);
+            if left > gone {
+                gone = left;
+                quiet_since = now;
+                moved = true;
             }
-            crate::runtime::sleep(SENT_POLL.min(by.saturating_duration_since(now))).await;
+            if now >= by {
+                if now.saturating_duration_since(quiet_since) >= DRAIN_STALL {
+                    if watch.is_none() {
+                        return self.stalled(number);
+                    }
+                    self.stop();
+                    return Drain::Stalled;
+                }
+                if moved && watch.is_none() {
+                    // Still sending: the place goes back, and the channel is
+                    // watched on, unless another send watches it already.
+                    self.drained(number);
+                    match Watch::start(&self.watching) {
+                        Some(started) => watch = Some(started),
+                        None => return Drain::Ended,
+                    }
+                }
+            }
+            let until = by.saturating_duration_since(now);
+            let poll = if watch.is_some() {
+                WATCH_POLL
+            } else if until.is_zero() {
+                SENT_POLL
+            } else {
+                SENT_POLL.min(until)
+            };
+            crate::runtime::sleep(poll).await;
         }
+    }
+
+    /// Bytes handed to the channel that have left it (natively, that the
+    /// peer has acknowledged), and those it still holds. What was handed is
+    /// read first: a message sent between the two reads counts as held but
+    /// not as handed, so what has left is never overcounted.
+    async fn channel_bytes(&self) -> (u64, u64) {
+        let handed = self.handed.load(Ordering::Acquire);
+        let unsent = u64::try_from(self.sender.unsent().await).unwrap_or(u64::MAX);
+        (handed.saturating_sub(unsent), unsent)
     }
 
     /// Bytes that have left the channel (natively, that the peer has
     /// acknowledged) since the last time this was asked.
     pub(super) async fn sent_since(&self) -> u64 {
-        let handed = self.handed.load(Ordering::Acquire);
-        let unsent = u64::try_from(self.sender.unsent().await).unwrap_or(u64::MAX);
-        let left = handed.saturating_sub(unsent);
+        let (left, _) = self.channel_bytes().await;
         left.saturating_sub(self.counted.fetch_max(left, Ordering::AcqRel))
     }
 
@@ -1167,10 +1237,36 @@ impl Link {
 /// How a record's place came to end.
 #[derive(Debug, PartialEq, Eq)]
 enum Drain {
-    /// Its channel emptied, its peer asked again, or the link closed.
+    /// Its channel emptied, its peer asked again while it held its place,
+    /// or the link closed; or, past the send's deadline, another send
+    /// watched its channel already.
     Ended,
-    /// Its channel still held bytes past the send's deadline.
+    /// Past the send's deadline its channel still held bytes, and had let
+    /// none out for [`DRAIN_STALL`]: the link is stopped.
     Stalled,
+}
+
+/// A send's turn to watch its link's channel for a stall, once it gave its
+/// place back: one at a time, as every such send would watch the same
+/// channel.
+struct Watch<'a>(&'a AtomicBool);
+
+impl<'a> Watch<'a> {
+    /// The turn, unless another send has it. Made only once taken: a turn
+    /// dropped gives the flag back.
+    fn start(watching: &'a AtomicBool) -> Option<Self> {
+        if watching.swap(true, Ordering::AcqRel) {
+            None
+        } else {
+            Some(Self(watching))
+        }
+    }
+}
+
+impl Drop for Watch<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// What became of a record's send.
