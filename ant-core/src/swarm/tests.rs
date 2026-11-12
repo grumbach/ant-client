@@ -2957,6 +2957,41 @@ async fn a_peer_that_stops_reading_loses_its_link_past_a_sends_deadline() {
     assert_eq!(alice.inner.upload_limit.running(), 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_record_handed_over_just_before_its_deadline_still_has_time_to_drain() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let mut peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    let link = only_link(&alice);
+    // One piece.
+    let (address, content) = record(1, 100);
+    knows(&[&alice], &[address]);
+    alice.seed(address, content);
+    next_offer(&mut peer).await;
+    // Nothing more leaves the channel.
+    rtc.0.unsent.store(1000, Ordering::Release);
+    let started = Clock::now();
+    send(&peer, Message::Get { id: 0, address }).await;
+    // The send takes all but half a second of the record's deadline.
+    let handing = SEND_DEADLINE - Duration::from_millis(500);
+    let handing_ms = u64::try_from(handing.as_millis()).unwrap_or(u64::MAX);
+    rtc.0.send_delay_ms.store(handing_ms, Ordering::Release);
+    let handed = started + handing;
+    // Past the deadline it has had half a second to leave the channel: it
+    // keeps its place, and the link stays.
+    tokio::time::sleep_until(started + SEND_DEADLINE + Duration::from_millis(100)).await;
+    assert!(!link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 1);
+    // It has as long as any channel may stay quiet once handed over.
+    tokio::time::sleep_until(handed + DRAIN_STALL - Duration::from_millis(200)).await;
+    assert!(!link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 1);
+    tokio::time::sleep_until(handed + DRAIN_STALL + Duration::from_millis(300)).await;
+    assert!(link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 0);
+}
+
 #[tokio::test]
 async fn a_link_counts_what_left_its_channel_once() {
     let rtc = SharedMemoryRtc::default();

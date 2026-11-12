@@ -217,7 +217,7 @@ mod tests {
 pub(crate) mod memory {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     type Ends = (EventSink, mpsc::Receiver<ChannelEvent>);
     /// Where the other end's sink goes once it answers.
@@ -237,6 +237,10 @@ pub(crate) mod memory {
         /// The bytes every channel says it holds unsent: none, unless a test
         /// says otherwise (the channels pass messages on at once).
         pub(crate) unsent: AtomicUsize,
+        /// How long, in milliseconds, every send asked for from now on takes
+        /// before the peer has the message: none, unless a test says
+        /// otherwise.
+        pub(crate) send_delay_ms: AtomicU64,
     }
 
     struct MemorySender {
@@ -256,7 +260,11 @@ pub(crate) mod memory {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
             let open_after = self.open_after.swap(false, Ordering::AcqRel);
+            let delay = Duration::from_millis(self.rtc.send_delay_ms.load(Ordering::Acquire));
             Box::pin(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 let peer = peer.ok_or_else(|| RtcError::new("not connected"))?;
                 let sent = peer.push(ChannelEvent::Message(Bytes::from(message)));
                 if open_after {
