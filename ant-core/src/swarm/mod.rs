@@ -474,13 +474,15 @@ impl Stop {
     }
 }
 
-/// `future`'s output, or `None` if `stop` fires first.
+/// `future`'s output, or `None` if `stop` fires first. `stop` is looked at
+/// before each poll of `future`, so once it has fired `future` makes no
+/// further step (a lookup sends no next batch, say), however ready it is.
 pub(crate) async fn or_stopped<F: Future>(stop: &Stop, future: F) -> Option<F::Output> {
     let future = std::pin::pin!(future);
     let stopped = std::pin::pin!(stop.wait());
-    match select(future, stopped).await {
-        Either::Left((output, _)) => Some(output),
-        Either::Right(_) => None,
+    match select(stopped, future).await {
+        Either::Left(_) => None,
+        Either::Right((output, _)) => Some(output),
     }
 }
 

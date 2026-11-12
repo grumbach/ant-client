@@ -1216,16 +1216,20 @@ async fn answer(
         sdp,
     });
     // `SHORT_REQUEST` in all, reaching the node included.
-    let sent = crate::runtime::timeout(
-        SHORT_REQUEST,
-        call(&swarm, &network, &node, request, SHORT_REQUEST),
+    let sent = unless_stopped(
+        &stop,
+        &room,
+        crate::runtime::timeout(
+            SHORT_REQUEST,
+            call(&swarm, &network, &node, request, SHORT_REQUEST),
+        ),
     )
     .await;
     let delivered = matches!(
         sent,
-        Ok(Ok(ChunkMessageBody::SwarmAnswerResponse(
+        Some(Ok(Ok(ChunkMessageBody::SwarmAnswerResponse(
             SwarmAnswerResponse::Delivered
-        )))
+        ))))
     );
     if delivered {
         count(&swarm, 1, |discovery| &discovery.answers_sent);
@@ -1233,6 +1237,15 @@ async fn answer(
         link.close();
     }
     drop(answering);
+}
+
+/// `send`'s output, or `None` if the room or the swarm stops first: a request
+/// still waiting to reach its node when they stop (for a connection, or for
+/// room to send) is dropped unsent.
+async fn unless_stopped<T>(stop: &Stop, room: &Room, send: impl Future<Output = T>) -> Option<T> {
+    or_stopped(stop, or_stopped(&room.stop, send))
+        .await
+        .flatten()
 }
 
 /// Sends one swarm request to `node` and waits for its reply.
@@ -1702,6 +1715,65 @@ mod tests {
             negotiate(&stop, &room, CONNECT_TIMEOUT, stuck),
         );
         assert_eq!(step.await.ok(), Some(None));
+        let _ = ending.await;
+    }
+
+    /// A request that takes one step each poll and is then ready, counting
+    /// its steps: a lookup's next batch, an answer reaching its node.
+    fn counted_step(steps: &AtomicUsize) -> impl Future<Output = ()> + '_ {
+        futures::future::poll_fn(move |_| {
+            steps.fetch_add(1, Ordering::AcqRel);
+            std::task::Poll::Ready(())
+        })
+    }
+
+    #[tokio::test]
+    async fn a_ready_step_is_not_taken_once_the_swarm_has_stopped() {
+        let stop = Stop::default();
+        let steps = AtomicUsize::new(0);
+        assert_eq!(or_stopped(&stop, counted_step(&steps)).await, Some(()));
+        stop.stop();
+        assert_eq!(or_stopped(&stop, counted_step(&steps)).await, None);
+        assert_eq!(steps.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_not_sent_once_the_room_or_the_swarm_has_stopped() {
+        let steps = AtomicUsize::new(0);
+        let room = Room::new([1; 32], 1, [0; 32]).unwrap_or_else(|| panic!("a room"));
+        let stop = Stop::default();
+        assert_eq!(
+            unless_stopped(&stop, &room, counted_step(&steps)).await,
+            Some(())
+        );
+        room.stop.stop();
+        assert_eq!(
+            unless_stopped(&stop, &room, counted_step(&steps)).await,
+            None
+        );
+        let room = Room::new([2; 32], 1, [0; 32]).unwrap_or_else(|| panic!("a room"));
+        stop.stop();
+        assert_eq!(
+            unless_stopped(&stop, &room, counted_step(&steps)).await,
+            None
+        );
+        assert_eq!(steps.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_waiting_to_reach_its_node_ends_when_the_swarm_stops() {
+        let room = Room::new([1; 32], 1, [0; 32]).unwrap_or_else(|| panic!("a room"));
+        let stop = Arc::new(Stop::default());
+        let waiting = futures::future::pending::<()>();
+        let ending = {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move { stop.stop() })
+        };
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            unless_stopped(&stop, &room, waiting),
+        );
+        assert_eq!(sent.await.ok(), Some(None));
         let _ = ending.await;
     }
 
