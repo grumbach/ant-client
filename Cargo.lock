@@ -938,7 +938,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.24.0"
-source = "git+https://github.com/grumbach/ant-node?branch=feat%2Fpeer-swarm#ad27073f5d8a6170fb641403320c41fbde186c96"
+source = "git+https://github.com/grumbach/ant-node?branch=feat%2Fpeer-swarm#ba9352ce4b1b873a737b3d0cc4765636fb90817f"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -949,6 +949,7 @@ dependencies = [
  "color-eyre",
  "directories",
  "evmlib",
+ "file-format",
  "flate2",
  "fs2",
  "futures",
