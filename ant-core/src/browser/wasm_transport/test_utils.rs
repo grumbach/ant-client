@@ -405,6 +405,59 @@ pub async fn test_guarded_request_queued_at_stop(endpoint: &str) -> Result<Strin
     }
 }
 
+/// A guarded request (a swarm room's lookup) whose sender finds the session's
+/// send buffer full, and whose wait for room fails with it still full; the
+/// guard then says to stop before the buffer drains. The request must not be
+/// sent. `buffer` sets the mock channel's buffer: `"full"`, `"low"` (the
+/// low-water event with the buffer still full) or `"empty"` (drained, with the
+/// event). Resolves with the request's error, or fails if it was sent.
+#[wasm_bindgen]
+pub async fn test_guarded_request_stopped_in_full_buffer(
+    endpoint: &str,
+    buffer: js_sys::Function,
+) -> Result<String, JsValue> {
+    let endpoint = parse_webrtc_direct_multiaddr(endpoint)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let client = BrowserNodeClientCore::new(endpoint);
+    let stopped = Rc::new(Cell::new(false));
+    let guard: multiplex::SendGuard = {
+        let stopped = Rc::clone(&stopped);
+        Rc::new(move || stopped.get())
+    };
+    let set = |state: &str| {
+        buffer
+            .call1(&JsValue::NULL, &JsValue::from_str(state))
+            .map(|_| ())
+    };
+    let result = {
+        let authenticated = client
+            .authenticated()
+            .await
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        set("full")?;
+        let target = "11".repeat(32);
+        let mut request = Box::pin(authenticated.find_node_guarded(&target, 20, Some(guard)));
+        if futures::poll!(&mut request).is_ready() {
+            return Err(JsValue::from_str("the request ended before its sender ran"));
+        }
+        // The sender task takes the send lock and waits for room.
+        crate::runtime::sleep(Duration::from_millis(20)).await;
+        // That wait ends with no room.
+        set("low")?;
+        crate::runtime::sleep(Duration::from_millis(20)).await;
+        stopped.set(true);
+        set("empty")?;
+        request.await
+    };
+    client.close();
+    match result {
+        Ok(_) => Err(JsValue::from_str(
+            "the guarded request was sent after the stop",
+        )),
+        Err(error) => Ok(error),
+    }
+}
+
 /// A swarm room's lookup whose task is already queued when the client stops
 /// sharing: the task runs after the stop, on an authenticated session, and
 /// must send no request. Resolves with the lookup's error, or fails if the

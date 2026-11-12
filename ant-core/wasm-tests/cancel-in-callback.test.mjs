@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BrowserNetworkClient } from "./client-fixture.mjs";
-import { encryptPublicFile, test_guarded_request_queued_at_stop, test_room_lookup_queued_at_stop, test_swarm_announce_queued_at_stop } from "./pkg/ant_core.js";
+import { encryptPublicFile, test_guarded_request_queued_at_stop, test_guarded_request_stopped_in_full_buffer, test_room_lookup_queued_at_stop, test_swarm_announce_queued_at_stop } from "./pkg/ant_core.js";
 import { mockWebRtc } from "./mock-webrtc.mjs";
 
 // An AbortSignal can abort inside one of the operation's own callbacks, which
@@ -179,6 +179,19 @@ test("a room's request whose sender is queued when sharing stops is not sent", a
   const before = () => rtc.requests.filter(request => request.method === "find_node").length;
   await test_guarded_request_queued_at_stop(rtc.endpoints[0]);
   assert.equal(before(), 0, "no lookup request sent");
+});
+
+// The sender finds the send buffer full, its wait for room ends with no room,
+// and sharing stops before the buffer drains: nothing may follow the stop.
+test("a room's request whose sender found no room in the send buffer is not sent after a stop", async () => {
+  const rtc = mockWebRtc([{}]);
+  const error = await test_guarded_request_stopped_in_full_buffer(rtc.endpoints[0], (state) => {
+    const channel = rtc.connections[0].channel;
+    channel.bufferedAmount = state === "empty" ? 0 : 3 * 1024 * 1024;
+    if (state !== "full") channel.onbufferedamountlow?.({});
+  });
+  assert.match(error, /DataChannel failed while transmitting/u);
+  assert.deepEqual(rtc.requests.filter(request => request.method === "find_node"), [], "no lookup request sent");
 });
 
 // An announce, which tells a node the room's key and joins the client to

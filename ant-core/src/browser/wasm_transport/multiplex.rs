@@ -240,7 +240,8 @@ impl RpcSession {
     }
 
     /// `guard`, when there is one, is looked at right before the request's
-    /// first frame: once it says so, the request is not sent.
+    /// first frame: once it says so, the request is not sent. A guarded
+    /// request whose send buffer has no room in time fails unsent.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn request(
         self: &Rc<Self>,
@@ -303,13 +304,27 @@ impl RpcSession {
             if guard.is_some() {
                 // The exchange sends its first frame in its first poll once
                 // the buffer has room: wait for that room here, so nothing
-                // yields between the guard's look below and that frame.
-                let _ = wait_for_buffer(
+                // yields between the guard's look below and that frame. A
+                // wait that ends without room fails as the exchange's send
+                // would, but sends nothing: the exchange would wait again
+                // after the guard's look.
+                if let Err(error) = wait_for_buffer(
                     &session.channel,
                     MAX_BUFFERED_AMOUNT,
                     RPC_ADMISSION_TIMEOUT.as_millis() as u32,
                 )
-                .await;
+                .await
+                {
+                    let error = session
+                        .inbox
+                        .check_failure()
+                        .err()
+                        .map(RpcError::Transport)
+                        .unwrap_or(error);
+                    session.close(error.to_string());
+                    let _ = sender.send(Err(error));
+                    return;
+                }
             }
             if sender.is_canceled()
                 || session.closed.get()
