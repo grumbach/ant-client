@@ -218,6 +218,7 @@ pub(crate) mod memory {
     use super::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     type Ends = (EventSink, mpsc::Receiver<ChannelEvent>);
     /// Where the other end's sink goes once it answers.
@@ -241,6 +242,13 @@ pub(crate) mod memory {
         /// before the peer has the message: none, unless a test says
         /// otherwise.
         pub(crate) send_delay_ms: AtomicU64,
+        /// Whether the next look at a channel that finds it empty is held,
+        /// having looked, until the test lets it go with `release_empty`.
+        pub(crate) hold_empty: AtomicBool,
+        /// Whether a look that found its channel empty is held so.
+        pub(crate) holding_empty: AtomicBool,
+        /// Lets a held look go on.
+        pub(crate) release_empty: Notify,
     }
 
     struct MemorySender {
@@ -280,7 +288,15 @@ pub(crate) mod memory {
 
         fn unsent(&self) -> BoxFuture<'_, usize> {
             let unsent = self.rtc.unsent.load(Ordering::Acquire);
-            Box::pin(async move { unsent })
+            let held = unsent == 0 && self.rtc.hold_empty.swap(false, Ordering::AcqRel);
+            Box::pin(async move {
+                if held {
+                    self.rtc.holding_empty.store(true, Ordering::Release);
+                    self.rtc.release_empty.notified().await;
+                    self.rtc.holding_empty.store(false, Ordering::Release);
+                }
+                unsent
+            })
         }
 
         fn close(&self) {

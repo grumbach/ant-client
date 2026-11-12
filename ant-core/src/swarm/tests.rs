@@ -12,7 +12,7 @@ use super::rtc::memory::SharedMemoryRtc;
 use super::rtc::{Channel, ChannelEvent};
 use super::wire::Message;
 use super::*;
-use crate::runtime::Clock;
+use crate::runtime::{set_page_hidden, Clock};
 
 const ROOM: RoomKey = [9; 32];
 /// The test room's secret, as every reader of its file derives it.
@@ -2990,6 +2990,168 @@ async fn a_record_handed_over_just_before_its_deadline_still_has_time_to_drain()
     tokio::time::sleep_until(handed + DRAIN_STALL + Duration::from_millis(300)).await;
     assert!(link.is_closed());
     assert_eq!(alice.inner.upload_limit.running(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_send_finding_its_channel_watched_as_it_empties_still_has_its_bytes_watched() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let mut peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    let link = only_link(&alice);
+    let (first, first_content) = record(1, 3 * wire::FRAME_BYTES);
+    let (second, second_content) = record(2, 100);
+    knows(&[&alice], &[first, second]);
+    alice.seed(first, first_content);
+    next_offer(&mut peer).await;
+    alice.seed(second, second_content);
+    next_offer(&mut peer).await;
+    // The first record's last 1000 bytes stay in the channel, and leave
+    // slowly: past its deadline it gives its place back and watches the
+    // channel.
+    rtc.0.unsent.store(1000, Ordering::Release);
+    let started = Clock::now();
+    send(
+        &peer,
+        Message::Get {
+            id: 0,
+            address: first,
+        },
+    )
+    .await;
+    whole_record(&mut peer, 0).await;
+    tokio::time::sleep_until(started + SEND_DEADLINE - Duration::from_secs(1)).await;
+    rtc.0.unsent.store(500, Ordering::Release);
+    tokio::time::sleep_until(started + SEND_DEADLINE + Duration::from_millis(100)).await;
+    assert!(!link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 0);
+    eventually("nothing else looks at the channel", || {
+        !alice.inner.counting_sent.load(Ordering::Acquire)
+    })
+    .await;
+    // The channel empties, and the watching send, having seen it so, is held
+    // there before it gives its turn back.
+    rtc.0.hold_empty.store(true, Ordering::Release);
+    rtc.0.unsent.store(0, Ordering::Release);
+    eventually("the watching send sees the channel empty", || {
+        rtc.0.holding_empty.load(Ordering::Acquire)
+    })
+    .await;
+    // Meanwhile the second record takes all but half a second of its
+    // deadline to hand over, and stays in the channel but for a little the
+    // peer reads.
+    rtc.0.unsent.store(1000, Ordering::Release);
+    let second_started = Clock::now();
+    send(
+        &peer,
+        Message::Get {
+            id: 1,
+            address: second,
+        },
+    )
+    .await;
+    let handing = SEND_DEADLINE - Duration::from_millis(500);
+    let handing_ms = u64::try_from(handing.as_millis()).unwrap_or(u64::MAX);
+    rtc.0.send_delay_ms.store(handing_ms, Ordering::Release);
+    tokio::time::sleep_until(second_started + handing + Duration::from_millis(100)).await;
+    rtc.0.unsent.store(900, Ordering::Release);
+    // Past its deadline still sending, it gives its place back and finds the
+    // channel watched already.
+    tokio::time::sleep_until(second_started + SEND_DEADLINE + Duration::from_millis(100)).await;
+    assert_eq!(alice.inner.upload_limit.running(), 0);
+    assert!(rtc.0.holding_empty.load(Ordering::Acquire));
+    assert!(!link.is_closed());
+    // The watching send goes on from its look at the empty channel; the
+    // channel then lets nothing out for as long as a channel may stay quiet,
+    // and the link goes.
+    let released = Clock::now();
+    rtc.0.release_empty.notify_one();
+    tokio::time::sleep_until(released + DRAIN_STALL - Duration::from_millis(200)).await;
+    assert!(!link.is_closed());
+    tokio::time::sleep_until(released + DRAIN_STALL + Duration::from_millis(300)).await;
+    assert!(link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_message_on_its_way_into_the_channel_hides_no_bytes_leaving_it() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let mut peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    let link = only_link(&alice);
+    let (address, content) = record(1, 3 * wire::FRAME_BYTES);
+    let (other, other_content) = record(2, 100);
+    knows(&[&alice], &[address, other]);
+    alice.seed(address, content);
+    next_offer(&mut peer).await;
+    // The record's last 1000 bytes stay in the channel, and leave slowly:
+    // past its deadline it gives its place back and watches the channel.
+    rtc.0.unsent.store(1000, Ordering::Release);
+    let started = Clock::now();
+    send(&peer, Message::Get { id: 0, address }).await;
+    whole_record(&mut peer, 0).await;
+    let read_last = started + SEND_DEADLINE - Duration::from_secs(1);
+    tokio::time::sleep_until(read_last).await;
+    rtc.0.unsent.store(500, Ordering::Release);
+    tokio::time::sleep_until(started + SEND_DEADLINE + Duration::from_millis(100)).await;
+    assert!(!link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 0);
+    // A second before the channel has been quiet too long, a message goes
+    // in, and the peer reads one byte: the channel counts the message's
+    // bytes at once, the link only once its send returns, 3 s later.
+    let going_in = read_last + DRAIN_STALL - Duration::from_secs(1);
+    tokio::time::sleep_until(going_in).await;
+    let have = Message::Have {
+        addresses: vec![other],
+    }
+    .encode()
+    .len();
+    rtc.0.send_delay_ms.store(3000, Ordering::Release);
+    alice.seed(other, other_content);
+    rtc.0.unsent.store(500 - 1 + have, Ordering::Release);
+    // The byte that left keeps the link.
+    tokio::time::sleep_until(read_last + DRAIN_STALL + Duration::from_millis(500)).await;
+    assert!(!link.is_closed());
+    // Nothing leaves after it.
+    let counted = going_in + Duration::from_secs(3);
+    tokio::time::sleep_until(counted + DRAIN_STALL - Duration::from_millis(200)).await;
+    assert!(!link.is_closed());
+    tokio::time::sleep_until(counted + DRAIN_STALL + Duration::from_millis(300)).await;
+    assert!(link.is_closed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_watched_channel_stays_watched_once_its_page_is_hidden() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let mut peer = hand_driven(&rtc, &alice).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    let link = only_link(&alice);
+    let (address, content) = record(1, 3 * wire::FRAME_BYTES);
+    knows(&[&alice], &[address]);
+    alice.seed(address, content);
+    next_offer(&mut peer).await;
+    // The record's last 1000 bytes stay in the channel, and leave slowly:
+    // past its deadline it gives its place back and watches the channel.
+    rtc.0.unsent.store(1000, Ordering::Release);
+    let started = Clock::now();
+    send(&peer, Message::Get { id: 0, address }).await;
+    whole_record(&mut peer, 0).await;
+    let read_last = started + SEND_DEADLINE - Duration::from_secs(1);
+    tokio::time::sleep_until(read_last).await;
+    rtc.0.unsent.store(500, Ordering::Release);
+    tokio::time::sleep_until(started + SEND_DEADLINE + Duration::from_millis(100)).await;
+    assert!(!link.is_closed());
+    assert_eq!(alice.inner.upload_limit.running(), 0);
+    // The page is hidden; the watching send holds no place, and watches on
+    // as the channel lets nothing more out.
+    set_page_hidden(true);
+    tokio::time::sleep_until(read_last + DRAIN_STALL - Duration::from_millis(200)).await;
+    assert!(!link.is_closed());
+    tokio::time::sleep_until(read_last + DRAIN_STALL + Duration::from_millis(300)).await;
+    assert!(link.is_closed());
+    set_page_hidden(false);
 }
 
 #[tokio::test]

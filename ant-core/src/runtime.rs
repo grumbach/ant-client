@@ -105,7 +105,7 @@ pub(crate) fn page_hidden() -> bool {
 }
 
 /// Whether this runs in a hidden browser page: never, natively.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(test)))]
 pub(crate) fn page_hidden() -> bool {
     false
 }
@@ -163,9 +163,76 @@ impl Drop for Unlisten {
 }
 
 /// Never ends: there is no page to hide natively.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(test)))]
 pub(crate) async fn until_page_hidden() {
     futures::future::pending().await
+}
+
+#[cfg(all(not(target_arch = "wasm32"), test))]
+pub(crate) use test_page::{page_hidden, set_page_hidden, until_page_hidden};
+
+/// Natively under test, a page each test thread's tasks run in, shown until
+/// the test hides it. Only a current-thread runtime runs all of a test's
+/// tasks on its own thread, so only there can a test hide their page.
+#[cfg(all(not(target_arch = "wasm32"), test))]
+mod test_page {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct Page {
+        hidden: AtomicBool,
+        changed: Notify,
+    }
+
+    thread_local! {
+        static PAGE: Arc<Page> = Arc::default();
+    }
+
+    fn page() -> Arc<Page> {
+        PAGE.with(Arc::clone)
+    }
+
+    /// Hides or shows the page of this test thread's tasks, in a test on a
+    /// current-thread runtime: on any other, tasks on other threads would
+    /// never see it.
+    pub(crate) fn set_page_hidden(hidden: bool) {
+        let flavor = Handle::try_current().map(|runtime| runtime.runtime_flavor());
+        assert!(
+            matches!(flavor, Ok(RuntimeFlavor::CurrentThread)),
+            "a test hides its page only on a current-thread runtime"
+        );
+        let page = page();
+        page.hidden.store(hidden, Ordering::Release);
+        page.changed.notify_waiters();
+    }
+
+    /// Whether the test has hidden the page of this thread's tasks.
+    pub(crate) fn page_hidden() -> bool {
+        page().hidden.load(Ordering::Acquire)
+    }
+
+    /// Ends once the test hides the page of this thread's tasks (at once if
+    /// it is hidden now).
+    pub(crate) async fn until_page_hidden() {
+        let page = page();
+        loop {
+            let changed = page.changed.notified();
+            if page.hidden.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic(expected = "only on a current-thread runtime")]
+    async fn a_test_on_a_multi_thread_runtime_cannot_hide_its_page() {
+        set_page_hidden(true);
+    }
 }
 
 /// Read the platform clock while preserving the protocol's serialized SystemTime type.
